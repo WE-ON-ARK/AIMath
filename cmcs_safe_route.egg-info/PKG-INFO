@@ -1,0 +1,127 @@
+Metadata-Version: 2.4
+Name: cmcs-safe-route
+Version: 0.1.0
+Summary: CMCS 기반 어린이 안전 통학 경로 추천 시스템
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: joblib>=1.3
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: networkx>=3.1
+Requires-Dist: requests>=2.31
+Requires-Dist: scikit-learn>=1.3
+Provides-Extra: ml
+Requires-Dist: xgboost>=2.0; extra == "ml"
+Requires-Dist: shap>=0.43; extra == "ml"
+Provides-Extra: geo
+Requires-Dist: geopandas>=0.14; extra == "geo"
+Requires-Dist: osmnx>=1.7; extra == "geo"
+Requires-Dist: pyproj>=3.6; extra == "geo"
+Requires-Dist: shapely>=2.0; extra == "geo"
+Provides-Extra: viz
+Requires-Dist: folium>=0.15; extra == "viz"
+Requires-Dist: matplotlib>=3.8; extra == "viz"
+Requires-Dist: plotly>=5.18; extra == "viz"
+Requires-Dist: seaborn>=0.13; extra == "viz"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+
+# CMCS 안전 통학 경로 추천 AI
+
+대전광역시 도로 구간별 어린이 이동 제약 점수(CMCS)를 계산하고, 거리와
+위험 노출량을 함께 고려해 안전 통학 경로를 추천하는 프로젝트입니다.
+
+현재 버전은 다음을 포함하는 실행 가능한 MVP입니다.
+
+- AHP 기반 CMCS 점수 및 세부 차원 산출
+- 공공데이터포털 JSON 페이지네이션 수집기
+- GeoPandas/OSMnx 기반 포인트–도로 간선 전처리
+- 회귀·위험 등급 분류 모델 비교와 평가 리포트
+- 최단거리·최저위험·균형 경로와 파레토 프론트
+- Folium 경로/CMCS 지도와 Plotly 파레토 차트
+- API 키 없이 실행되는 합성 대전 도로망 데모
+
+## 빠른 시작
+
+Python 3.10 이상을 사용합니다.
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,viz]"
+python main.py demo
+pytest
+```
+
+데모 산출물은 다음 위치에 생성됩니다.
+
+```text
+data/processed/edge_cmcs.csv
+data/graph/demo_walk.graphml
+outputs/maps/cmcs_heatmap.html
+outputs/maps/route_comparison.html
+outputs/charts/pareto_front.html
+outputs/reports/route_comparison.csv
+outputs/reports/pareto_front.csv
+```
+
+## 실제 데이터 연동
+
+전체 지리·ML 의존성을 설치하고 환경 변수를 설정합니다.
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+export DATA_GO_KR_API_KEY="발급받은_서비스키"
+python main.py collect --year 2023
+python main.py download-network
+```
+
+공공데이터포털 API는 활용신청한 데이터셋마다 엔드포인트와 응답 컬럼이
+다를 수 있습니다. `src/data_collector.py`의 `APIEndpoint`를 이용해 승인된
+API 명세를 등록한 뒤, 좌표 컬럼명을 확인하여 `Preprocessor.unify_crs`에
+전달합니다.
+
+## 핵심 설계
+
+CMCS는 위험도, 보행불편도, 혼잡도, 시야방해도, 횡단위험도를 합산하고
+과속방지턱·CCTV·어린이보호구역을 안전 보너스로 차감합니다. 모든 점수는
+0~1 범위로 제한됩니다.
+
+안전 경로 비용은 단순한 구간 CMCS 합이 아니라 다음 위험 노출량을
+기본으로 사용합니다.
+
+```text
+risk_exposure = length_m × CMCS
+safety_cost = length_m × (risk_floor + CMCS)
+```
+
+`risk_floor`는 CMCS가 0인 구간을 무제한으로 우회하는 현상을 막습니다.
+멀티그래프의 병렬 간선도 실제 최적화에 선택된 간선 키를 유지해 거리와
+위험 합계를 계산합니다.
+
+## 프로젝트 구조
+
+```text
+src/
+  data_collector.py
+  preprocessor.py
+  cmcs_calculator.py
+  model_trainer.py
+  route_optimizer.py
+  visualizer.py
+  demo.py
+tests/
+main.py
+config.py
+```
+
+## 다음 개발 단계
+
+1. 승인받은 공공데이터 API별 엔드포인트와 좌표 컬럼 매핑
+2. 대전 OSM 보행망과 실데이터 공간 조인
+3. 학습/검증 데이터 누수 점검 및 공간 교차검증
+4. 학교–학원 실제 OD 쌍의 경로 평가
+5. 가중치 민감도·Ablation·구별 안전 격차 리포트
+
