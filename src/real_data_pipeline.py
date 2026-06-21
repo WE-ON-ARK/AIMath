@@ -138,6 +138,67 @@ def _academy_counts(data_dir: Path) -> dict[str, int]:
     return counts
 
 
+def load_academy_locations(
+    data_dir: Path,
+    geocoder: object | None = None,
+    cache_path: str | None = None,
+) -> pd.DataFrame:
+    """학원·교습소 목록을 로드하고 지오코딩된 위치를 추가한다.
+
+    geocoder가 None이거나 API 키가 없으면 구 단위 카운트만 반환한다.
+    KAKAO_API_KEY 환경변수가 설정되어 있으면 자동으로 활성화된다.
+    """
+    from src.geocoder import KakaoGeocoder
+
+    files = sorted(data_dir.glob("*교육지원청+학원+및+교습소+현황*.xlsx"))
+    if not files:
+        raise FileNotFoundError("학원·교습소 XLSX 파일이 없습니다.")
+
+    rows: list[dict[str, object]] = []
+    for path in files:
+        workbook = pd.ExcelFile(path)
+        for sheet_name in workbook.sheet_names:
+            frame = pd.read_excel(path, sheet_name=sheet_name)
+            address_col = next(
+                (col for col in frame.columns if "주소" in str(col)), None
+            )
+            name_col = next(
+                (col for col in frame.columns if str(col) in {"학원명", "교습소명"}),
+                None,
+            )
+            if address_col is None or name_col is None:
+                continue
+            for _, row in frame[[name_col, address_col]].dropna().drop_duplicates().iterrows():
+                addr = str(row[address_col]).strip()
+                rows.append(
+                    {
+                        "name": str(row[name_col]),
+                        "address": addr,
+                        "district": extract_district(addr),
+                    }
+                )
+
+    df = pd.DataFrame(rows).drop_duplicates(subset=["name", "address"])
+
+    if geocoder is None:
+        geocoder = KakaoGeocoder(
+            cache_path=cache_path or "cache/geocoder_academy.json"
+        )
+
+    if geocoder.has_key:  # type: ignore[union-attr]
+        df = geocoder.geocode_dataframe(df, "address")  # type: ignore[union-attr]
+        geocoded = df["geocoded_lat"].notna().sum()
+        print(
+            f"[지오코딩] {geocoded}/{len(df)} 학원 위치 확보 "
+            f"(캐시: {geocoder.cache_size}건)"  # type: ignore[union-attr]
+        )
+    else:
+        df["geocoded_lat"] = None
+        df["geocoded_lon"] = None
+
+    return df
+
+
 def _nearby_ratio(
     frame: pd.DataFrame,
     distances: np.ndarray,

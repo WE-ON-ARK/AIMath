@@ -235,25 +235,45 @@ def collect_school_zones(
 def collect_osm_point_features(
     place: str = "Daejeon, South Korea",
 ) -> dict[str, Path]:
+    """OSM에서 버스 정류장 및 가로등 포인트 데이터를 수집한다.
+
+    가로등은 highway=street_lamp 외에 amenity=street_lamp,
+    power=pole+street_lamp=yes 태그도 함께 쿼리해 커버리지를 높인다.
+    """
     ox.settings.use_cache = True
     outputs: dict[str, Path] = {}
-    tags_by_name = {
-        "bus_stop": {"highway": "bus_stop"},
-        "streetlight": {"highway": "street_lamp"},
+
+    tag_sets: dict[str, list[dict[str, object]]] = {
+        "bus_stop": [{"highway": "bus_stop"}],
+        "streetlight": [
+            {"highway": "street_lamp"},
+            {"amenity": "street_lamp"},
+        ],
     }
-    for name, tags in tags_by_name.items():
+    for name, tag_list in tag_sets.items():
         path = RAW_DATA_DIR / f"{name}.geojson"
-        try:
-            features = ox.features_from_place(place, tags).reset_index()
-            columns = [
-                column
-                for column in ("element_type", "osmid", "name", "highway", "geometry")
-                if column in features.columns
-            ]
-            features[columns].to_file(path, driver="GeoJSON")
+        frames = []
+        for tags in tag_list:
+            try:
+                feats = ox.features_from_place(place, tags).reset_index()
+                feats = feats[feats.geometry.geom_type.eq("Point")]
+                columns = [
+                    col
+                    for col in ("element_type", "osmid", "name", "highway", "amenity", "geometry")
+                    if col in feats.columns
+                ]
+                frames.append(feats[columns])
+            except Exception as exc:
+                print(f"[OSM 보조 데이터 생략] {name}/{tags}: {exc}")
+        if frames:
+            import geopandas as _gpd
+            combined = _gpd.GeoDataFrame(
+                pd.concat(frames, ignore_index=True).drop_duplicates(subset=["osmid"] if "osmid" in frames[0].columns else None),
+                crs="EPSG:4326",
+            )
+            combined.to_file(path, driver="GeoJSON")
             outputs[name] = path
-        except Exception as exc:
-            print(f"[OSM 보조 데이터 생략] {name}: {exc}")
+            print(f"[OSM] {name}: {len(combined)}개 수집")
     return outputs
 
 
