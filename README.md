@@ -22,7 +22,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,viz]"
 python main.py demo
-pytest
+pytest  # 테스트 70개 실행
 ```
 
 데모 산출물은 다음 위치에 생성됩니다.
@@ -116,6 +116,7 @@ python main.py full-pipeline --refresh-data --refresh-network
 pip install -r requirements.txt
 cp .env.example .env
 export DATA_GO_KR_API_KEY="발급받은_서비스키"
+export KAKAO_API_KEY="발급받은_카카오_REST_API_키"
 python main.py collect --year 2023
 python main.py download-network
 ```
@@ -124,6 +125,49 @@ python main.py download-network
 다를 수 있습니다. `src/data_collector.py`의 `APIEndpoint`를 이용해 승인된
 API 명세를 등록한 뒤, 좌표 컬럼명을 확인하여 `Preprocessor.unify_crs`에
 전달합니다.
+
+`KAKAO_API_KEY`는 `src/geocoder.py`의 `KakaoGeocoder`가 사용합니다.
+지오코딩 결과는 파일 캐시에 저장되어 재요청을 줄입니다.
+
+## API 서비스
+
+FastAPI 기반 경로 추천 서비스입니다.
+
+```bash
+uvicorn api.main:app --reload
+```
+
+브라우저에서 `static/index.html`을 열면 Leaflet.js 지도 기반 웹 UI를
+사용할 수 있습니다.
+
+| 메서드 | 엔드포인트 | 설명 |
+|--------|-----------|------|
+| POST | `/route/recommend` | 출발지·목적지 기반 안전 경로 추천 |
+| POST | `/route/compare` | 복수 경로 비교 (최단·최저위험·균형) |
+| GET | `/search/schools` | 학교 목록 검색 |
+| GET | `/search/academies` | 학원 목록 검색 |
+| GET | `/health` | 서비스 상태 확인 |
+| GET | `/metrics` | 운영 지표 조회 |
+
+## Docker 배포
+
+Docker Compose로 전체 서비스를 실행합니다.
+
+```bash
+# 기본 서비스 실행
+docker compose up
+
+# 데이터 갱신 스케줄러 포함 실행
+docker compose --profile scheduler up
+```
+
+주요 환경 변수:
+
+| 변수 | 설명 |
+|------|------|
+| `DATA_GO_KR_API_KEY` | 공공데이터포털 서비스키 |
+| `KAKAO_API_KEY` | 카카오 REST API 키 (지오코딩) |
+| `CMCS_GRAPH_PATH` | 사전 구축된 GraphML 경로 (선택) |
 
 ## 핵심 설계
 
@@ -147,22 +191,46 @@ safety_cost = length_m × (risk_floor + CMCS)
 
 ```text
 src/
-  data_collector.py
-  preprocessor.py
-  cmcs_calculator.py
-  model_trainer.py
-  route_optimizer.py
-  visualizer.py
-  demo.py
-tests/
+  data_collector.py       # 공공데이터포털 JSON 페이지네이션 수집
+  preprocessor.py         # GeoPandas/OSMnx 포인트–도로 간선 전처리
+  cmcs_calculator.py      # AHP 기반 CMCS 점수 계산
+  model_trainer.py        # 회귀·분류 모델 학습 및 비교
+  route_optimizer.py      # 최단·최저위험·균형 경로와 파레토 프론트
+  visualizer.py           # Folium 지도 및 Plotly 차트 생성
+  demo.py                 # 합성 대전 도로망 데모
+  data_quality.py         # 좌표 bbox·결측·중복 검사, DATA_VINTAGE 정의
+  geocoder.py             # KakaoGeocoder (파일 캐시, KAKAO_API_KEY 필요)
+  model_validation.py     # CMCS 민감도, Ablation, 보정, 임계값, 시계열 분할, 구별 홀드아웃
+  route_validator.py      # AgeProfile(low/mid/high/middle), TimeWeights, batch_od_evaluation
+api/
+  main.py                 # FastAPI 앱 및 라우터
+static/
+  index.html              # Leaflet.js 기반 웹 UI
+tests/                    # 테스트 70개
 main.py
 config.py
 ```
 
+## 모델 검증
+
+`src/model_validation.py`는 다음 6종의 검증을 자동 실행합니다.
+
+| 검증 항목 | 내용 |
+|-----------|------|
+| CMCS 민감도 | AHP 가중치 ±20% 교란 → Spearman ρ, Tier 변동율 |
+| Ablation Test | LeaveOneGroupOut AUC 기반 특성별 기여도 측정 |
+| 보정 분석 | Reliability Diagram + Brier Score |
+| 임계값 최적화 | F1 최대화 기준 0.05–0.95 구간 탐색 |
+| 시계열 분할 | 연도별 Train/Test 분리 검증 |
+| 구별 홀드아웃 | 5개 구 Leave-One-Out 요약 |
+
+```bash
+python -c "from src.model_validation import run_full_model_validation; run_full_model_validation()"
+```
+
 ## 다음 개발 단계
 
-1. 승인받은 공공데이터 API별 엔드포인트와 좌표 컬럼 매핑
-2. 대전 OSM 보행망과 실데이터 공간 조인
-3. 학습/검증 데이터 누수 점검 및 공간 교차검증
-4. 학교–학원 실제 OD 쌍의 경로 평가
-5. 가중치 민감도·Ablation·구별 안전 격차 리포트
+- 공공데이터 API 키 발급 후 실 데이터로 전체 파이프라인 재실행
+- 가로등 실측 데이터 확보 (현재 OSM 희박 — 7개 포인트)
+- 사고 이력 데이터 보강 (현재 22건 → 통계 신뢰도 제한)
+- 클라우드(GCP/AWS) 배포 및 모바일 UI 연동
