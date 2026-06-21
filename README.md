@@ -37,6 +37,77 @@ outputs/reports/route_comparison.csv
 outputs/reports/pareto_front.csv
 ```
 
+## 병합된 실데이터 학습
+
+`data` 브랜치의 대전 학교·횡단보도·신호등·학원·불법주정차 자료와
+공공데이터 API에서 받은 어린이보호구역 사고 다발지역 CSV를 사용합니다.
+
+```bash
+python main.py real-data
+```
+
+산출물:
+
+```text
+data/processed/daejeon_school_risk_features.csv
+models/real_school_hotspot_model.pkl
+outputs/reports/real_data_model_report.json
+outputs/reports/school_hotspot_predictions.csv
+outputs/reports/verified_accident_locations.csv
+outputs/reports/verified_accident_summary.json
+outputs/maps/verified_accident_hotspots.html
+outputs/charts/real_model_feature_importance.png
+```
+
+라벨은 개별 사고 전체가 아니라 한국도로교통공단 API가 지정한
+`어린이보호구역 내 어린이 교통사고 다발지역`입니다. 따라서 음성 라벨은
+무사고를 뜻하지 않으며, 모델 평가는 구 단위 Leave-One-Group-Out 방식으로
+공간 누수를 줄여 수행합니다.
+
+## 전체 실제 경로 파이프라인
+
+다음 명령은 공식 API·OSM·병합 데이터로 아래 과정을 순차 실행합니다.
+
+```bash
+python main.py full-pipeline
+```
+
+1. 과속방지턱과 어린이보호구역 공식 API 수집
+2. 대전 전체 OSM 보행 도로망 구축 또는 캐시 로드
+3. 횡단보도·신호등·과속방지턱·버스정류장·보호구역·사고를 도로 구간에 결합
+4. OSM 도로 등급, 제한속도, 차로, 보도, 조명 태그 기반 프록시 생성
+5. AHP CMCS 계산
+6. 2km 공간 그룹 교차검증을 적용한 도로 사고 위험 모델 학습
+7. 검증 성능에 따라 AHP와 ML 위험 확률을 자동 혼합
+8. 대전문정초등학교에서 실제 둔산 지역 학원까지 최단·안전·균형 경로 산출
+9. 경로 비교 CSV, 파레토 데이터, HTML 지도, 모델·종합 리포트 저장
+
+주요 결과:
+
+```text
+data/processed/daejeon_edge_features.csv
+data/processed/daejeon_edge_cmcs.csv
+data/graph/daejeon_walk_cmcs.graphml
+models/edge_accident_risk_model.pkl
+outputs/maps/actual_safe_route.html
+outputs/maps/daejeon_cmcs_risk_map.html
+outputs/reports/actual_route_comparison.csv
+outputs/reports/actual_route_pareto.csv
+outputs/reports/actual_route_avoided_segments.csv
+outputs/reports/edge_model_report.json
+outputs/reports/full_pipeline_report.json
+outputs/charts/edge_model_roc_pr.png
+outputs/charts/edge_model_explainability.png
+outputs/charts/actual_route_pareto.html
+outputs/charts/district_safety_radar.html
+```
+
+데이터와 도로망을 다시 내려받으려면 다음 플래그를 사용합니다.
+
+```bash
+python main.py full-pipeline --refresh-data --refresh-network
+```
+
 ## 실제 데이터 연동
 
 전체 지리·ML 의존성을 설치하고 환경 변수를 설정합니다.
@@ -95,4 +166,3 @@ config.py
 3. 학습/검증 데이터 누수 점검 및 공간 교차검증
 4. 학교–학원 실제 OD 쌍의 경로 평가
 5. 가중치 민감도·Ablation·구별 안전 격차 리포트
-

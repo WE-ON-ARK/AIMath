@@ -1,0 +1,1483 @@
+from __future__ import annotations
+
+import ast
+import json
+import math
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Iterable
+
+import geopandas as gpd
+import joblib
+import networkx as nx
+import numpy as np
+import osmnx as ox
+import pandas as pd
+import requests
+from pypdf import PdfReader
+from pyproj import Transformer
+from scipy.spatial import cKDTree
+from shapely.geometry import Point
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_curve,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from config import (
+    CHART_OUTPUT_DIR,
+    GRAPH_DATA_DIR,
+    MAP_OUTPUT_DIR,
+    MODEL_DIR,
+    PROCESSED_DATA_DIR,
+    RAW_DATA_DIR,
+    REPORT_OUTPUT_DIR,
+    SETTINGS,
+    ensure_directories,
+)
+from src.cmcs_calculator import CMCSCalculator
+from src.real_data_pipeline import (
+    DISTRICTS,
+    extract_district,
+    read_csv_flexible,
+)
+from src.route_optimizer import RouteOptimizer
+
+
+PROJECTED_CRS = "EPSG:5179"
+FULL_GRAPH_PATH = GRAPH_DATA_DIR / "daejeon_walk.graphml"
+SCORED_GRAPH_PATH = GRAPH_DATA_DIR / "daejeon_walk_cmcs.graphml"
+EDGE_FEATURE_PATH = PROCESSED_DATA_DIR / "daejeon_edge_features.csv"
+EDGE_CMCS_PATH = PROCESSED_DATA_DIR / "daejeon_edge_cmcs.csv"
+EDGE_MODEL_PATH = MODEL_DIR / "edge_accident_risk_model.pkl"
+EDGE_MODEL_REPORT_PATH = REPORT_OUTPUT_DIR / "edge_model_report.json"
+FULL_PIPELINE_REPORT_PATH = REPORT_OUTPUT_DIR / "full_pipeline_report.json"
+
+EDGE_MODEL_FEATURES = [
+    "traffic_volume_norm",
+    "avg_speed_norm",
+    "narrow_sidewalk_norm",
+    "slope_norm",
+    "is_alley",
+    "pedestrian_flow_norm",
+    "academy_density_norm",
+    "bus_stop_nearby_norm",
+    "illegal_parking_norm",
+    "light_density_norm",
+    "has_crosswalk",
+    "has_signal",
+    "lane_count_norm",
+    "has_speed_bump",
+    "has_cctv",
+    "is_school_zone",
+    "crosswalk_count_norm",
+    "signal_count_norm",
+    "speed_bump_count_norm",
+]
+
+DISTRICT_QUERIES = {
+    "대덕구": "Daedeok-gu, Daejeon, South Korea",
+    "동구": "Dong-gu, Daejeon, South Korea",
+    "중구": "Jung-gu, Daejeon, South Korea",
+    "서구": "Seo-gu, Daejeon, South Korea",
+    "유성구": "Yuseong-gu, Daejeon, South Korea",
+}
+
+HIGHWAY_TRAFFIC_PROXY = {
+    "motorway": 1.00,
+    "motorway_link": 0.95,
+    "trunk": 0.95,
+    "trunk_link": 0.90,
+    "primary": 0.88,
+    "primary_link": 0.84,
+    "secondary": 0.76,
+    "secondary_link": 0.72,
+    "tertiary": 0.62,
+    "tertiary_link": 0.58,
+    "residential": 0.34,
+    "unclassified": 0.30,
+    "living_street": 0.18,
+    "service": 0.16,
+    "pedestrian": 0.08,
+    "footway": 0.04,
+    "path": 0.03,
+    "steps": 0.01,
+    "track": 0.08,
+}
+
+HIGHWAY_SPEED_PROXY = {
+    "motorway": 100.0,
+    "motorway_link": 60.0,
+    "trunk": 80.0,
+    "trunk_link": 55.0,
+    "primary": 60.0,
+    "primary_link": 45.0,
+    "secondary": 50.0,
+    "secondary_link": 40.0,
+    "tertiary": 40.0,
+    "tertiary_link": 35.0,
+    "residential": 30.0,
+    "unclassified": 30.0,
+    "living_street": 15.0,
+    "service": 15.0,
+    "pedestrian": 5.0,
+    "footway": 5.0,
+    "path": 5.0,
+    "steps": 3.0,
+    "track": 10.0,
+}
+
+
+def _api_key_from_environment_or_pdf(pdf_path: Path) -> str:
+    if SETTINGS.api_key:
+        return SETTINGS.api_key
+    text = "\n".join(
+        page.extract_text() or "" for page in PdfReader(pdf_path).pages
+    )
+    matches = re.findall(r"\b[0-9a-fA-F]{64}\b", text)
+    if not matches:
+        raise ValueError(
+            f"API 인증키를 찾지 못했습니다. DATA_GO_KR_API_KEY를 설정하세요: {pdf_path}"
+        )
+    return matches[0]
+
+
+def collect_speed_bumps(
+    output_path: str | Path = RAW_DATA_DIR / "speed_bump.csv",
+) -> pd.DataFrame:
+    key = _api_key_from_environment_or_pdf(
+        Path("data/과속방지턱조회서비스.pdf")
+    )
+    response = requests.get(
+        "https://apis.data.go.kr/6300000/GetSdhpListService/getSdhpList",
+        params={
+            "serviceKey": key,
+            "pageNo": 1,
+            "numOfRows": 10000,
+            "type": "json",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    header = payload.get("response", {}).get("header", {})
+    if str(header.get("resultCode")) != "00":
+        raise RuntimeError(f"과속방지턱 API 오류: {header}")
+    items = (
+        payload.get("response", {})
+        .get("body", {})
+        .get("items", {})
+        .get("item", [])
+    )
+    if isinstance(items, dict):
+        items = [items]
+    frame = pd.DataFrame(items)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+    return frame
+
+
+def collect_school_zones(
+    output_path: str | Path = RAW_DATA_DIR / "school_zone.csv",
+) -> pd.DataFrame:
+    key = _api_key_from_environment_or_pdf(Path("data/어린이보호구역 정보.pdf"))
+    endpoint = (
+        "https://apis.data.go.kr/6300000/"
+        "kidSafeDaejeonService/kidSafeDaejeonList"
+    )
+    rows: list[dict[str, str | None]] = []
+    page = 1
+    total_count: int | None = None
+    while True:
+        response = requests.get(
+            endpoint,
+            params={"serviceKey": key, "pageNo": page, "numOfRows": 100},
+            timeout=60,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        return_code = root.findtext(".//returnCode")
+        if return_code != "00":
+            raise RuntimeError(
+                f"어린이보호구역 API 오류: {root.findtext('.//returnMessage')}"
+            )
+        if total_count is None:
+            total_count = int(root.findtext(".//totalCount") or 0)
+        page_items = [
+            {child.tag: child.text for child in node}
+            for node in root.findall(".//MsgBody/items")
+        ]
+        rows.extend(page_items)
+        if not page_items or len(rows) >= total_count:
+            break
+        page += 1
+    frame = pd.DataFrame(rows)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(path, index=False, encoding="utf-8-sig")
+    return frame
+
+
+def collect_osm_point_features(
+    place: str = "Daejeon, South Korea",
+) -> dict[str, Path]:
+    ox.settings.use_cache = True
+    outputs: dict[str, Path] = {}
+    tags_by_name = {
+        "bus_stop": {"highway": "bus_stop"},
+        "streetlight": {"highway": "street_lamp"},
+    }
+    for name, tags in tags_by_name.items():
+        path = RAW_DATA_DIR / f"{name}.geojson"
+        try:
+            features = ox.features_from_place(place, tags).reset_index()
+            columns = [
+                column
+                for column in ("element_type", "osmid", "name", "highway", "geometry")
+                if column in features.columns
+            ]
+            features[columns].to_file(path, driver="GeoJSON")
+            outputs[name] = path
+        except Exception as exc:
+            print(f"[OSM 보조 데이터 생략] {name}: {exc}")
+    return outputs
+
+
+def collect_available_real_data(refresh: bool = False) -> dict[str, int]:
+    ensure_directories()
+    counts: dict[str, int] = {}
+    speed_path = RAW_DATA_DIR / "speed_bump.csv"
+    zone_path = RAW_DATA_DIR / "school_zone.csv"
+    if refresh or not speed_path.exists():
+        counts["speed_bump"] = len(collect_speed_bumps(speed_path))
+    else:
+        counts["speed_bump"] = len(read_csv_flexible(speed_path))
+    if refresh or not zone_path.exists():
+        counts["school_zone"] = len(collect_school_zones(zone_path))
+    else:
+        counts["school_zone"] = len(read_csv_flexible(zone_path))
+    if refresh or not (RAW_DATA_DIR / "bus_stop.geojson").exists():
+        collect_osm_point_features()
+    for name in ("bus_stop", "streetlight"):
+        path = RAW_DATA_DIR / f"{name}.geojson"
+        counts[name] = len(gpd.read_file(path)) if path.exists() else 0
+    return counts
+
+
+def build_or_load_walk_graph(
+    graph_path: str | Path = FULL_GRAPH_PATH,
+    place: str = "Daejeon, South Korea",
+    refresh: bool = False,
+) -> nx.MultiDiGraph:
+    path = Path(graph_path)
+    if path.exists() and not refresh:
+        return ox.load_graphml(path)
+    graph = ox.graph_from_place(place, network_type="walk")
+    _assign_edge_identifiers(graph)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ox.save_graphml(graph, filepath=path)
+    return graph
+
+
+def _normalize_osmid(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return "-".join(sorted(map(str, value)))
+    text = str(value)
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple, set)):
+                return "-".join(sorted(map(str, parsed)))
+        except (SyntaxError, ValueError):
+            pass
+    return re.sub(r"[^0-9A-Za-z_-]+", "-", text)
+
+
+def canonical_segment_id(u: object, v: object, osmid: object = "") -> str:
+    left, right = sorted((str(u), str(v)))
+    return f"S-{left}-{right}-{_normalize_osmid(osmid)}"
+
+
+def _assign_edge_identifiers(graph: nx.MultiDiGraph) -> None:
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        data["edge_id"] = f"E-{u}-{v}-{key}"
+        data["segment_id"] = canonical_segment_id(u, v, data.get("osmid", ""))
+
+
+def _first_value(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return str(next(iter(value), ""))
+    text = str(value)
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple, set)) and parsed:
+                return str(next(iter(parsed)))
+        except (SyntaxError, ValueError):
+            pass
+    return text
+
+
+def _parse_number(value: object, default: float = 0.0) -> float:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default
+    values = re.findall(r"\d+(?:\.\d+)?", _first_value(value))
+    if not values:
+        return default
+    return float(values[0])
+
+
+def _highway_value(value: object) -> str:
+    return _first_value(value).lower()
+
+
+def _road_base_features(row: pd.Series) -> dict[str, float]:
+    highway = _highway_value(row.get("highway", "unclassified"))
+    traffic = HIGHWAY_TRAFFIC_PROXY.get(highway, 0.25)
+    default_speed = HIGHWAY_SPEED_PROXY.get(highway, 25.0)
+    speed = _parse_number(row.get("maxspeed"), default_speed)
+    lanes = _parse_number(row.get("lanes"), 1.0)
+    sidewalk = str(row.get("sidewalk", "")).lower()
+    foot_only = highway in {"footway", "pedestrian", "path", "steps"}
+    arterial = highway in {
+        "motorway",
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "motorway_link",
+        "trunk_link",
+        "primary_link",
+        "secondary_link",
+        "tertiary_link",
+    }
+    if foot_only:
+        narrow_sidewalk = 0.05
+    elif sidewalk in {"both", "left", "right", "yes", "separate"}:
+        narrow_sidewalk = 0.20
+    elif sidewalk in {"no", "none"}:
+        narrow_sidewalk = 1.0
+    elif arterial:
+        narrow_sidewalk = 0.72
+    else:
+        narrow_sidewalk = 0.55
+
+    incline = abs(_parse_number(row.get("incline"), 0.0))
+    slope = min(incline / 15.0, 1.0)
+    lit_tag = str(row.get("lit", "")).lower()
+    if lit_tag in {"yes", "24/7", "automatic"}:
+        lit_score = 1.0
+    elif lit_tag == "no":
+        lit_score = 0.0
+    else:
+        lit_score = 0.5
+    return {
+        "traffic_volume_proxy": traffic,
+        "avg_speed_kph": speed,
+        "lane_count": lanes,
+        "narrow_sidewalk_proxy": narrow_sidewalk,
+        "slope_proxy": slope,
+        "is_alley": float(highway in {"service", "living_street"}),
+        "lit_tag_score": lit_score,
+    }
+
+
+def _academy_and_parking_counts(data_dir: Path) -> tuple[dict[str, int], dict[str, int]]:
+    academy_counts: dict[str, int] = {}
+    for path in sorted(data_dir.glob("*교육지원청+학원+및+교습소+현황*.xlsx")):
+        workbook = pd.ExcelFile(path)
+        for sheet_name in workbook.sheet_names:
+            frame = pd.read_excel(path, sheet_name=sheet_name)
+            address_column = next(
+                (column for column in frame.columns if "주소" in str(column)), None
+            )
+            name_column = next(
+                (
+                    column
+                    for column in frame.columns
+                    if str(column) in {"학원명", "교습소명"}
+                ),
+                None,
+            )
+            if address_column is None or name_column is None:
+                continue
+            places = frame[[name_column, address_column]].dropna().drop_duplicates()
+            for district, count in (
+                places[address_column].map(extract_district).value_counts().items()
+            ):
+                academy_counts[str(district)] = (
+                    academy_counts.get(str(district), 0) + int(count)
+                )
+
+    parking_path = next(data_dir.glob("*불법주정차*.csv"))
+    parking = read_csv_flexible(parking_path)
+    parking["district"] = parking["자치구"].map(extract_district)
+    parking_counts = {
+        str(district): int(count)
+        for district, count in zip(parking["district"], parking["단속건수"])
+        if pd.notna(district)
+    }
+    return academy_counts, parking_counts
+
+
+def _load_point_datasets(data_dir: Path) -> dict[str, gpd.GeoDataFrame]:
+    crosswalk = read_csv_flexible(next(data_dir.glob("*횡단보도*.csv")))
+    signal = read_csv_flexible(next(data_dir.glob("*신호등*.csv")))
+    speed_bump = read_csv_flexible(RAW_DATA_DIR / "speed_bump.csv")
+    school_zone = read_csv_flexible(RAW_DATA_DIR / "school_zone.csv")
+    accident = read_csv_flexible(
+        RAW_DATA_DIR / "daejeon_schoolzone_accident_hotspots.csv"
+    )
+
+    def points(
+        frame: pd.DataFrame, lon_column: str, lat_column: str
+    ) -> gpd.GeoDataFrame:
+        clean = frame.copy()
+        clean[lon_column] = pd.to_numeric(clean[lon_column], errors="coerce")
+        clean[lat_column] = pd.to_numeric(clean[lat_column], errors="coerce")
+        clean = clean.dropna(subset=[lon_column, lat_column])
+        return gpd.GeoDataFrame(
+            clean,
+            geometry=gpd.points_from_xy(clean[lon_column], clean[lat_column]),
+            crs="EPSG:4326",
+        )
+
+    datasets = {
+        "crosswalk": points(crosswalk, "경도", "위도"),
+        "signal": points(signal, "경도", "위도"),
+        "speed_bump": points(speed_bump, "LONGITUDE", "LATITUDE"),
+        "school_zone": points(school_zone, "longitude", "latitude"),
+        "accident": points(accident, "lo_crd", "la_crd"),
+    }
+    for name in ("bus_stop", "streetlight"):
+        path = RAW_DATA_DIR / f"{name}.geojson"
+        if path.exists():
+            frame = gpd.read_file(path)
+            frame = frame[frame.geometry.geom_type.eq("Point")].copy()
+            datasets[name] = frame.to_crs("EPSG:4326")
+    return datasets
+
+
+def _district_polygons(refresh: bool = False) -> gpd.GeoDataFrame:
+    path = RAW_DATA_DIR / "daejeon_districts.geojson"
+    if path.exists() and not refresh:
+        return gpd.read_file(path)
+    rows = []
+    for district, query in DISTRICT_QUERIES.items():
+        frame = ox.geocode_to_gdf(query)
+        frame["district"] = district
+        rows.append(frame[["district", "geometry"]])
+    result = gpd.GeoDataFrame(
+        pd.concat(rows, ignore_index=True), crs="EPSG:4326"
+    )
+    result.to_file(path, driver="GeoJSON")
+    return result
+
+
+def _minmax(series: pd.Series, log_scale: bool = False) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    if log_scale:
+        values = np.log1p(values.clip(lower=0))
+    minimum, maximum = float(values.min()), float(values.max())
+    if np.isclose(minimum, maximum):
+        return pd.Series(0.0, index=series.index)
+    return (values - minimum) / (maximum - minimum)
+
+
+def _combine_points_for_nearest_edge(
+    datasets: dict[str, gpd.GeoDataFrame],
+) -> gpd.GeoDataFrame:
+    frames = []
+    for name in ("crosswalk", "signal", "speed_bump", "bus_stop", "streetlight"):
+        if name not in datasets or datasets[name].empty:
+            continue
+        frame = datasets[name][["geometry"]].copy()
+        frame["dataset"] = name
+        frame["source_index"] = datasets[name].index.astype(str)
+        frames.append(frame)
+    return gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True), crs="EPSG:4326"
+    )
+
+
+def build_edge_feature_table(
+    graph: nx.MultiDiGraph,
+    data_dir: str | Path = "data",
+    output_path: str | Path = EDGE_FEATURE_PATH,
+) -> tuple[pd.DataFrame, nx.MultiDiGraph]:
+    _assign_edge_identifiers(graph)
+    graph_projected = ox.project_graph(graph, to_crs=PROJECTED_CRS)
+    edges = ox.graph_to_gdfs(graph_projected, nodes=False).reset_index()
+    base_records = []
+    for _, row in edges.iterrows():
+        base = _road_base_features(row)
+        base_records.append(
+            {
+                "edge_id": str(row["edge_id"]),
+                "segment_id": str(row["segment_id"]),
+                "u": row["u"],
+                "v": row["v"],
+                "key": row["key"],
+                "length_m": float(row.get("length", 1.0)),
+                "highway": _highway_value(row.get("highway", "")),
+                "geometry": row.geometry,
+                **base,
+            }
+        )
+    directed = gpd.GeoDataFrame(base_records, crs=PROJECTED_CRS)
+    segments = (
+        directed.sort_values("length_m")
+        .drop_duplicates("segment_id")
+        .reset_index(drop=True)
+    )
+    segment_centers = segments.geometry.interpolate(0.5, normalized=True)
+    segments["center_x"] = segment_centers.x
+    segments["center_y"] = segment_centers.y
+
+    datasets = _load_point_datasets(Path(data_dir))
+    combined = _combine_points_for_nearest_edge(datasets)
+    if not combined.empty:
+        combined_projected = combined.to_crs(PROJECTED_CRS)
+        nearest = ox.distance.nearest_edges(
+            graph_projected,
+            X=combined_projected.geometry.x.to_numpy(),
+            Y=combined_projected.geometry.y.to_numpy(),
+        )
+        edge_to_segment = {
+            (row.u, row.v, row.key): row.segment_id
+            for row in directed.itertuples()
+        }
+        combined["segment_id"] = [
+            edge_to_segment[(u, v, key)] for u, v, key in nearest
+        ]
+        counts = (
+            combined.groupby(["segment_id", "dataset"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        for name in ("crosswalk", "signal", "speed_bump", "bus_stop", "streetlight"):
+            segments[f"{name}_count"] = segments["segment_id"].map(
+                counts[name] if name in counts else {}
+            ).fillna(0)
+    else:
+        for name in ("crosswalk", "signal", "speed_bump", "bus_stop", "streetlight"):
+            segments[f"{name}_count"] = 0
+
+    tree = cKDTree(segments[["center_x", "center_y"]].to_numpy())
+    transformer = Transformer.from_crs("EPSG:4326", PROJECTED_CRS, always_xy=True)
+
+    school_zones = datasets["school_zone"].copy()
+    sx, sy = transformer.transform(
+        school_zones.geometry.x.to_numpy(), school_zones.geometry.y.to_numpy()
+    )
+    segments["is_school_zone"] = 0
+    segments["school_zone_cctv_count"] = 0
+    cctv_values = school_zones["cctv"].astype(str).str.strip().eq("설치").to_numpy()
+    for x, y, has_cctv in zip(sx, sy, cctv_values):
+        indices = tree.query_ball_point([x, y], r=200.0)
+        if not indices:
+            continue
+        segments.loc[indices, "is_school_zone"] = 1
+        if has_cctv:
+            segments.loc[indices, "school_zone_cctv_count"] += 1
+
+    accidents = datasets["accident"].copy()
+    ax, ay = transformer.transform(
+        accidents.geometry.x.to_numpy(), accidents.geometry.y.to_numpy()
+    )
+    segments["accident_count"] = 0.0
+    segments["casualty_count"] = 0.0
+    segments["death_count"] = 0.0
+    for point_index, (x, y) in enumerate(zip(ax, ay)):
+        indices = tree.query_ball_point([x, y], r=300.0)
+        if not indices:
+            continue
+        row = accidents.iloc[point_index]
+        segments.loc[indices, "accident_count"] += float(row["occrrnc_cnt"])
+        segments.loc[indices, "casualty_count"] += float(row["caslt_cnt"])
+        segments.loc[indices, "death_count"] += float(row["dth_dnv_cnt"])
+
+    polygons = _district_polygons().to_crs(PROJECTED_CRS)
+    center_gdf = gpd.GeoDataFrame(
+        segments[["segment_id"]],
+        geometry=segment_centers,
+        crs=PROJECTED_CRS,
+    )
+    joined = gpd.sjoin(
+        center_gdf,
+        polygons[["district", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+    district_map = (
+        joined.dropna(subset=["district"])
+        .drop_duplicates("segment_id")
+        .set_index("segment_id")["district"]
+    )
+    segments["district"] = segments["segment_id"].map(district_map)
+    missing = segments["district"].isna()
+    if missing.any():
+        nearest_district = gpd.sjoin_nearest(
+            center_gdf.loc[missing],
+            polygons[["district", "geometry"]],
+            how="left",
+        )
+        segments.loc[missing, "district"] = nearest_district[
+            "district"
+        ].to_numpy()
+
+    academy_counts, parking_counts = _academy_and_parking_counts(Path(data_dir))
+    segments["academy_density"] = segments["district"].map(academy_counts).fillna(0)
+    segments["illegal_parking"] = segments["district"].map(parking_counts).fillna(0)
+
+    segments["has_crosswalk"] = (segments["crosswalk_count"] > 0).astype(int)
+    segments["has_signal"] = (segments["signal_count"] > 0).astype(int)
+    segments["has_speed_bump"] = (segments["speed_bump_count"] > 0).astype(int)
+    segments["has_cctv"] = (
+        segments["school_zone_cctv_count"] > 0
+    ).astype(int)
+    segments["traffic_volume_norm"] = segments["traffic_volume_proxy"].clip(0, 1)
+    segments["avg_speed_norm"] = (segments["avg_speed_kph"] / 100.0).clip(0, 1)
+    segments["narrow_sidewalk_norm"] = segments[
+        "narrow_sidewalk_proxy"
+    ].clip(0, 1)
+    segments["slope_norm"] = segments["slope_proxy"].clip(0, 1)
+    segments["academy_density_norm"] = _minmax(
+        segments["academy_density"], log_scale=True
+    )
+    segments["illegal_parking_norm"] = _minmax(
+        segments["illegal_parking"], log_scale=True
+    )
+    segments["bus_stop_nearby_norm"] = _minmax(
+        segments["bus_stop_count"], log_scale=True
+    )
+    segments["lane_count_norm"] = (
+        segments["lane_count"].clip(lower=1, upper=6) / 6.0
+    )
+    segments["crosswalk_count_norm"] = _minmax(
+        segments["crosswalk_count"], log_scale=True
+    )
+    segments["signal_count_norm"] = _minmax(
+        segments["signal_count"], log_scale=True
+    )
+    segments["speed_bump_count_norm"] = _minmax(
+        segments["speed_bump_count"], log_scale=True
+    )
+    segments["accident_count_norm"] = _minmax(
+        segments["accident_count"], log_scale=True
+    )
+    streetlight_signal = _minmax(
+        segments["streetlight_count"], log_scale=True
+    )
+    segments["light_density_norm"] = np.maximum(
+        segments["lit_tag_score"], streetlight_signal
+    )
+    segments["pedestrian_flow_norm"] = (
+        0.45 * segments["academy_density_norm"]
+        + 0.35 * segments["bus_stop_nearby_norm"]
+        + 0.20 * segments["is_school_zone"]
+    ).clip(0, 1)
+
+    scored = CMCSCalculator().score(segments.drop(columns="geometry"))
+    geometry_lookup = segments.set_index("segment_id")["geometry"]
+    scored["geometry_wkt"] = scored["segment_id"].map(
+        geometry_lookup.map(lambda geometry: geometry.wkt)
+    )
+
+    directed_columns = directed[
+        ["edge_id", "segment_id", "u", "v", "key", "length_m"]
+    ]
+    full = directed_columns.merge(
+        scored.drop(
+            columns=["edge_id", "u", "v", "key", "length_m"],
+            errors="ignore",
+        ),
+        on="segment_id",
+        how="left",
+    )
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    full.to_csv(path, index=False, encoding="utf-8-sig")
+    return full, graph
+
+
+def _edge_metrics(y: pd.Series, probability: np.ndarray) -> dict[str, object]:
+    prediction = probability >= 0.5
+    return {
+        "roc_auc": round(float(roc_auc_score(y, probability)), 6),
+        "average_precision": round(
+            float(average_precision_score(y, probability)), 6
+        ),
+        "balanced_accuracy": round(
+            float(balanced_accuracy_score(y, prediction)), 6
+        ),
+        "precision": round(
+            float(precision_score(y, prediction, zero_division=0)), 6
+        ),
+        "recall": round(
+            float(recall_score(y, prediction, zero_division=0)), 6
+        ),
+        "f1": round(float(f1_score(y, prediction, zero_division=0)), 6),
+        "confusion_matrix": confusion_matrix(y, prediction).tolist(),
+    }
+
+
+def train_edge_risk_model(
+    edge_features: pd.DataFrame,
+    model_path: str | Path = EDGE_MODEL_PATH,
+    report_path: str | Path = EDGE_MODEL_REPORT_PATH,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    segments = edge_features.drop_duplicates("segment_id").copy()
+    segments["accident_label"] = (segments["accident_count"] > 0).astype(int)
+    positive = segments[segments["accident_label"].eq(1)]
+    negative = segments[segments["accident_label"].eq(0)]
+    negative_limit = min(len(negative), max(25_000, len(positive) * 6))
+    negative_sample = negative.sample(
+        negative_limit, random_state=random_state
+    )
+    training = pd.concat([positive, negative_sample]).sample(
+        frac=1, random_state=random_state
+    )
+
+    X = training[EDGE_MODEL_FEATURES]
+    y = training["accident_label"]
+    grid_x = np.floor(training["center_x"] / 2000).astype(int)
+    grid_y = np.floor(training["center_y"] / 2000).astype(int)
+    groups = grid_x.astype(str) + ":" + grid_y.astype(str)
+    splitter = StratifiedGroupKFold(
+        n_splits=5, shuffle=True, random_state=random_state
+    )
+
+    models = {
+        "LogisticRegression": Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    LogisticRegression(
+                        class_weight="balanced",
+                        max_iter=3000,
+                        C=0.5,
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
+        "HistGradientBoosting": Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    HistGradientBoostingClassifier(
+                        learning_rate=0.08,
+                        max_iter=180,
+                        max_leaf_nodes=24,
+                        min_samples_leaf=30,
+                        l2_regularization=1.0,
+                        class_weight="balanced",
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
+    }
+
+    metrics: dict[str, dict[str, object]] = {}
+    probabilities: dict[str, np.ndarray] = {}
+    for name, model in models.items():
+        probability = cross_val_predict(
+            model,
+            X,
+            y,
+            groups=groups,
+            cv=splitter,
+            method="predict_proba",
+            n_jobs=-1,
+        )[:, 1]
+        probabilities[name] = probability
+        metrics[name] = _edge_metrics(y, probability)
+
+    best_name = max(
+        metrics,
+        key=lambda name: (
+            metrics[name]["average_precision"],
+            metrics[name]["roc_auc"],
+        ),
+    )
+    best_model = models[best_name]
+    best_model.fit(X, y)
+    all_probability = best_model.predict_proba(segments[EDGE_MODEL_FEATURES])[:, 1]
+    segments["ml_risk_probability"] = all_probability
+
+    best_metrics = metrics[best_name]
+    if best_metrics["roc_auc"] >= 0.70:
+        blend_weight = 0.35
+    elif best_metrics["roc_auc"] >= 0.60:
+        blend_weight = 0.20
+    else:
+        blend_weight = 0.0
+    segments["cmcs_final"] = (
+        (1.0 - blend_weight) * segments["cmcs"]
+        + blend_weight * segments["ml_risk_probability"]
+    ).clip(0, 1)
+
+    model_path = Path(model_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": best_model,
+            "feature_columns": EDGE_MODEL_FEATURES,
+            "blend_weight": blend_weight,
+            "label": "accident hotspot within 300m of road segment",
+        },
+        model_path,
+    )
+    validation_predictions = training[
+        ["segment_id", "district", "accident_label"]
+    ].copy()
+    validation_predictions["spatial_cv_probability"] = probabilities[best_name]
+    validation_prediction_path = (
+        REPORT_OUTPUT_DIR / "edge_model_validation_predictions.csv"
+    )
+    validation_predictions.to_csv(
+        validation_prediction_path, index=False, encoding="utf-8-sig"
+    )
+
+    roc_path = CHART_OUTPUT_DIR / "edge_model_roc_pr.png"
+    _plot_edge_model_validation(
+        y, probabilities[best_name], best_name, roc_path
+    )
+    explain_path = CHART_OUTPUT_DIR / "edge_model_explainability.png"
+    explanation_method = _explain_edge_model(
+        best_model,
+        training[EDGE_MODEL_FEATURES],
+        explain_path,
+    )
+    prevalence = float(training["accident_label"].mean())
+    ap_lift = (
+        float(best_metrics["average_precision"]) / prevalence
+        if prevalence > 0
+        else 0.0
+    )
+    report = {
+        "segment_count": int(len(segments)),
+        "training_count": int(len(training)),
+        "positive_segment_count": int(segments["accident_label"].sum()),
+        "positive_rate_full": round(float(segments["accident_label"].mean()), 6),
+        "validation": "5-fold StratifiedGroupKFold with 2km spatial grid groups",
+        "features": EDGE_MODEL_FEATURES,
+        "models": metrics,
+        "best_model": best_name,
+        "cmcs_ml_blend_weight": blend_weight,
+        "average_precision_lift_over_training_prevalence": round(ap_lift, 4),
+        "research_validation_passed": (
+            best_metrics["roc_auc"] >= 0.70 and ap_lift >= 2.0
+        ),
+        "production_deployment_ready": False,
+        "explanation_method": explanation_method,
+        "artifacts": {
+            "validation_predictions": str(validation_prediction_path),
+            "roc_pr_chart": str(roc_path),
+            "explainability_chart": str(explain_path),
+        },
+        "limitations": [
+            "사고 라벨은 개별 사고 원장이 아니라 어린이보호구역 사고 다발지역 중심 반경 300m이다.",
+            "사고와 시설 데이터의 기준연도가 완전히 일치하지 않는다.",
+            "교통량은 OSM 도로 등급 기반 프록시이며 실측 교통량이 아니다.",
+            "학원 밀도와 불법주정차는 구 단위 집계라 도로별 국지 변동을 충분히 표현하지 못한다.",
+        ],
+    }
+    path = Path(report_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return segments, report
+
+
+def _plot_edge_model_validation(
+    target: pd.Series,
+    probability: np.ndarray,
+    model_name: str,
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    false_positive_rate, true_positive_rate, _ = roc_curve(target, probability)
+    precision, recall, _ = precision_recall_curve(target, probability)
+    roc_auc = roc_auc_score(target, probability)
+    average_precision = average_precision_score(target, probability)
+
+    figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    axes[0].plot(
+        false_positive_rate,
+        true_positive_rate,
+        color="#2563eb",
+        label=f"{model_name} (AUC={roc_auc:.3f})",
+    )
+    axes[0].plot([0, 1], [0, 1], "k--", alpha=0.35)
+    axes[0].set_title("Spatial CV ROC")
+    axes[0].set_xlabel("False positive rate")
+    axes[0].set_ylabel("True positive rate")
+    axes[0].legend()
+
+    axes[1].plot(
+        recall,
+        precision,
+        color="#16a34a",
+        label=f"{model_name} (AP={average_precision:.3f})",
+    )
+    axes[1].axhline(
+        float(pd.Series(target).mean()),
+        color="#6b7280",
+        linestyle="--",
+        label="Prevalence",
+    )
+    axes[1].set_title("Spatial CV Precision-Recall")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel("Precision")
+    axes[1].legend()
+    figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _explain_edge_model(
+    model: Pipeline,
+    features: pd.DataFrame,
+    output_path: Path,
+) -> str:
+    import matplotlib.pyplot as plt
+
+    estimator = model.named_steps["model"]
+    sample = features.sample(min(2500, len(features)), random_state=42)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import shap
+
+        transformed = model.named_steps["imputer"].transform(sample)
+        if "scaler" in model.named_steps:
+            transformed = model.named_steps["scaler"].transform(transformed)
+        explainer = shap.Explainer(
+            estimator,
+            transformed,
+            feature_names=EDGE_MODEL_FEATURES,
+        )
+        values = explainer(transformed)
+        shap.plots.bar(values, max_display=14, show=False)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close()
+        return "SHAP"
+    except Exception:
+        plt.close("all")
+        if hasattr(estimator, "coef_"):
+            importance = pd.Series(
+                np.abs(estimator.coef_[0]), index=EDGE_MODEL_FEATURES
+            ).sort_values().tail(14)
+            figure, axis = plt.subplots(figsize=(9, 6))
+            importance.plot.barh(ax=axis, color="#2563eb")
+            axis.set_title("Absolute standardized logistic coefficients")
+            figure.tight_layout()
+            figure.savefig(output_path, dpi=160, bbox_inches="tight")
+            plt.close(figure)
+            return "absolute logistic coefficients (SHAP fallback)"
+        return "not available"
+
+
+def apply_scores_to_graph(
+    graph: nx.MultiDiGraph,
+    segment_scores: pd.DataFrame,
+    output_path: str | Path = SCORED_GRAPH_PATH,
+) -> nx.MultiDiGraph:
+    score_map = segment_scores.set_index("segment_id")[
+        ["cmcs", "cmcs_final", "ml_risk_probability"]
+    ].to_dict(orient="index")
+    for _, _, _, data in graph.edges(keys=True, data=True):
+        scores = score_map.get(str(data["segment_id"]), {})
+        data["cmcs_ahp"] = float(scores.get("cmcs", 0.5))
+        data["cmcs"] = float(scores.get("cmcs_final", data["cmcs_ahp"]))
+        data["ml_risk_probability"] = float(
+            scores.get("ml_risk_probability", 0.5)
+        )
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ox.save_graphml(graph, filepath=path)
+    return graph
+
+
+def create_city_risk_map(
+    segment_scores: pd.DataFrame,
+    output_path: str | Path = MAP_OUTPUT_DIR / "daejeon_cmcs_risk_map.html",
+    max_segments: int = 5000,
+) -> Path:
+    import folium
+
+    unique = segment_scores.drop_duplicates("segment_id").copy()
+    unique = unique.nlargest(min(max_segments, len(unique)), "cmcs_final")
+    geometry = gpd.GeoSeries.from_wkt(unique["geometry_wkt"], crs=PROJECTED_CRS)
+    risk_gdf = gpd.GeoDataFrame(
+        unique[
+            [
+                "segment_id",
+                "district",
+                "highway",
+                "cmcs",
+                "cmcs_final",
+                "ml_risk_probability",
+            ]
+        ].copy(),
+        geometry=geometry,
+        crs=PROJECTED_CRS,
+    ).to_crs("EPSG:4326")
+    risk_gdf["cmcs_final"] = risk_gdf["cmcs_final"].round(4)
+    risk_gdf["ml_risk_probability"] = risk_gdf[
+        "ml_risk_probability"
+    ].round(4)
+    map_object = folium.Map(
+        location=[36.3504, 127.3845],
+        zoom_start=12,
+        tiles="CartoDB positron",
+    )
+
+    def style_function(feature):
+        value = float(feature["properties"]["cmcs_final"])
+        if value >= 0.65:
+            color = "#b91c1c"
+        elif value >= 0.55:
+            color = "#ef4444"
+        elif value >= 0.45:
+            color = "#f59e0b"
+        else:
+            color = "#84cc16"
+        return {"color": color, "weight": 3, "opacity": 0.72}
+
+    folium.GeoJson(
+        json.loads(risk_gdf.to_json()),
+        style_function=style_function,
+        tooltip=folium.GeoJsonTooltip(
+            fields=[
+                "district",
+                "highway",
+                "cmcs_final",
+                "ml_risk_probability",
+            ],
+            aliases=["자치구", "도로 유형", "최종 CMCS", "ML 위험 확률"],
+        ),
+        name="상위 위험 도로",
+    ).add_to(map_object)
+    legend = """
+    <div style="position:fixed;bottom:25px;left:25px;z-index:9999;
+    background:white;padding:10px 12px;border:1px solid #bbb;border-radius:6px">
+    <b>CMCS 상위 위험 도로</b><br>
+    <span style="color:#b91c1c">━</span> 0.65 이상<br>
+    <span style="color:#ef4444">━</span> 0.55~0.65<br>
+    <span style="color:#f59e0b">━</span> 0.45~0.55<br>
+    <span style="color:#84cc16">━</span> 0.45 미만
+    </div>
+    """
+    map_object.get_root().html.add_child(folium.Element(legend))
+    folium.LayerControl().add_to(map_object)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    map_object.save(path)
+    return path
+
+
+def create_pareto_chart(
+    pareto: pd.DataFrame,
+    output_path: str | Path = CHART_OUTPUT_DIR / "actual_route_pareto.html",
+) -> Path:
+    import plotly.express as px
+
+    figure = px.line(
+        pareto.sort_values("lambda"),
+        x="distance_m",
+        y="cmcs",
+        color="lambda",
+        markers=True,
+        title="Actual route Pareto frontier: distance vs risk exposure",
+        labels={
+            "distance_m": "Walking distance (m)",
+            "cmcs": "CMCS risk exposure",
+            "lambda": "Distance weight λ",
+        },
+    )
+    figure.update_layout(template="plotly_white")
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.write_html(path)
+    return path
+
+
+def create_district_safety_outputs(
+    segment_scores: pd.DataFrame,
+    csv_path: str | Path = REPORT_OUTPUT_DIR / "district_safety_summary.csv",
+    chart_path: str | Path = CHART_OUTPUT_DIR / "district_safety_radar.html",
+) -> tuple[pd.DataFrame, Path]:
+    import plotly.graph_objects as go
+
+    unique = segment_scores.drop_duplicates("segment_id").copy()
+    unique["high_risk"] = (unique["cmcs_final"] >= 0.6).astype(int)
+    unique["accident_labeled"] = (unique["accident_count"] > 0).astype(int)
+    unique["infrastructure_coverage"] = (
+        unique[["has_crosswalk", "has_signal", "has_speed_bump", "has_cctv"]]
+        .mean(axis=1)
+        .clip(0, 1)
+    )
+    unique["walking_comfort"] = (1 - unique["narrow_sidewalk_norm"]).clip(0, 1)
+    summary = (
+        unique.groupby("district")
+        .agg(
+            average_cmcs=("cmcs_final", "mean"),
+            high_risk_ratio=("high_risk", "mean"),
+            accident_labeled_ratio=("accident_labeled", "mean"),
+            infrastructure_coverage=("infrastructure_coverage", "mean"),
+            walking_comfort=("walking_comfort", "mean"),
+            segment_count=("segment_id", "size"),
+        )
+        .reset_index()
+    )
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    summary.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    categories = [
+        "average_cmcs",
+        "high_risk_ratio",
+        "accident_labeled_ratio",
+        "infrastructure_coverage",
+        "walking_comfort",
+    ]
+    figure = go.Figure()
+    for _, row in summary.iterrows():
+        figure.add_trace(
+            go.Scatterpolar(
+                r=[float(row[column]) for column in categories],
+                theta=categories,
+                fill="toself",
+                name=row["district"],
+            )
+        )
+    figure.update_layout(
+        title="Daejeon district CMCS and walking-safety indicators",
+        polar={"radialaxis": {"visible": True, "range": [0, 1]}},
+        template="plotly_white",
+    )
+    chart_path = Path(chart_path)
+    chart_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.write_html(chart_path)
+    return summary, chart_path
+
+
+def _actual_route_endpoints(data_dir: Path) -> dict[str, object]:
+    schools = read_csv_flexible(next(data_dir.glob("*초중등학교위치*.csv")))
+    origin_row = schools[schools["학교명"].eq("대전문정초등학교")].iloc[0]
+    academy_file = next(data_dir.glob("서부교육지원청+학원+및+교습소+현황*.xlsx"))
+    academies = pd.read_excel(academy_file, sheet_name="학원")
+    address_column = next(
+        column for column in academies.columns if "학원주소" in str(column)
+    )
+    academy_row = academies[
+        academies["학원명"].eq("둔산씨엠에스학원")
+    ].iloc[0]
+    # Nominatim이 한국어 상세 주소를 안정적으로 인식하지 못해 같은 도로명 주소를
+    # 영문 질의로 지오코딩한 좌표를 재현 가능한 기본값으로 사용한다.
+    destination_query = "136 Dunsan-ro, Seo-gu, Daejeon, South Korea"
+    try:
+        destination_latitude, destination_longitude = ox.geocode(
+            destination_query
+        )
+    except Exception:
+        destination_latitude, destination_longitude = (
+            36.3513309,
+            127.3807830,
+        )
+    return {
+        "origin_name": str(origin_row["학교명"]),
+        "origin_address": str(origin_row["소재지도로명주소"]),
+        "origin": (float(origin_row["위도"]), float(origin_row["경도"])),
+        "destination_name": str(academy_row["학원명"]),
+        "destination_address": str(academy_row[address_column]),
+        "destination": (
+            float(destination_latitude),
+            float(destination_longitude),
+        ),
+        "destination_geocode_query": destination_query,
+    }
+
+
+def create_actual_route_map(
+    graph: nx.MultiDiGraph,
+    routes: list[dict[str, object]],
+    endpoints: dict[str, object],
+    output_path: str | Path = MAP_OUTPUT_DIR / "actual_safe_route.html",
+) -> Path:
+    import folium
+
+    origin = endpoints["origin"]
+    destination = endpoints["destination"]
+    map_object = folium.Map(
+        location=[
+            (origin[0] + destination[0]) / 2,
+            (origin[1] + destination[1]) / 2,
+        ],
+        zoom_start=15,
+        tiles="CartoDB positron",
+    )
+    colors = {
+        "최단거리": "#2563eb",
+        "최저위험": "#16a34a",
+        "균형": "#f59e0b",
+    }
+    for route in routes:
+        coordinates = [
+            (float(graph.nodes[node]["y"]), float(graph.nodes[node]["x"]))
+            for node in route["path"]
+        ]
+        label = str(route["mode"])
+        color = next(
+            (
+                value
+                for prefix, value in colors.items()
+                if label.startswith(prefix)
+            ),
+            "#6b7280",
+        )
+        popup = (
+            f"<b>{label}</b><br>"
+            f"거리: {route['total_distance_m']:.0f}m<br>"
+            f"평균 CMCS: {route['average_cmcs']:.3f}<br>"
+            f"위험 노출량: {route['total_cmcs']:.2f}"
+        )
+        folium.PolyLine(
+            coordinates,
+            color=color,
+            weight=7,
+            opacity=0.78,
+            tooltip=label,
+            popup=popup,
+        ).add_to(map_object)
+    folium.Marker(
+        origin,
+        tooltip=f"출발: {endpoints['origin_name']}",
+        popup=endpoints["origin_address"],
+        icon=folium.Icon(color="blue", icon="education"),
+    ).add_to(map_object)
+    folium.Marker(
+        destination,
+        tooltip=f"도착: {endpoints['destination_name']}",
+        popup=endpoints["destination_address"],
+        icon=folium.Icon(color="red", icon="flag"),
+    ).add_to(map_object)
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    map_object.save(path)
+    return path
+
+
+def run_actual_route_recommendation(
+    graph: nx.MultiDiGraph,
+    edge_scores: pd.DataFrame,
+    data_dir: str | Path = "data",
+) -> dict[str, object]:
+    endpoints = _actual_route_endpoints(Path(data_dir))
+    cmcs = edge_scores[["edge_id", "cmcs_final"]].rename(
+        columns={"cmcs_final": "cmcs"}
+    )
+    optimizer = RouteOptimizer(graph=graph, cmcs_data=cmcs)
+    origin = endpoints["origin"]
+    destination = endpoints["destination"]
+    shortest = optimizer.shortest_route(origin, destination)
+    safest = optimizer.safest_route(origin, destination)
+    balanced = optimizer.balanced_route(origin, destination, lam=0.65)
+    routes = [shortest, safest, balanced]
+
+    comparison = optimizer.compare_routes(origin, destination)
+    balanced_row = {
+        "mode": balanced["mode"],
+        "total_distance_m": balanced["total_distance_m"],
+        "total_cmcs": balanced["total_cmcs"],
+        "average_cmcs": balanced["average_cmcs"],
+        "extra_distance_m": round(
+            balanced["total_distance_m"] - shortest["total_distance_m"], 2
+        ),
+        "cmcs_reduction_pct": round(
+            (
+                shortest["total_cmcs"] - balanced["total_cmcs"]
+            )
+            / shortest["total_cmcs"]
+            * 100
+            if shortest["total_cmcs"] > 0
+            else 0,
+            2,
+        ),
+        "num_segments": balanced["num_segments"],
+    }
+    comparison = pd.concat(
+        [
+            comparison[~comparison["mode"].str.startswith("균형")],
+            pd.DataFrame([balanced_row]),
+        ],
+        ignore_index=True,
+    )
+    comparison_path = REPORT_OUTPUT_DIR / "actual_route_comparison.csv"
+    comparison.to_csv(comparison_path, index=False, encoding="utf-8-sig")
+    pareto_path = REPORT_OUTPUT_DIR / "actual_route_pareto.csv"
+    pareto = optimizer.generate_pareto_front(
+        origin, destination, steps=21, save_path=pareto_path
+    )
+    pareto_chart_path = create_pareto_chart(pareto)
+    shortest_ids = set(optimizer.path_edge_ids(shortest))
+    safest_ids = set(optimizer.path_edge_ids(safest))
+    avoided_ids = shortest_ids - safest_ids
+    avoided = edge_scores[
+        edge_scores["edge_id"].astype(str).isin(avoided_ids)
+    ][
+        [
+            "edge_id",
+            "segment_id",
+            "district",
+            "highway",
+            "length_m",
+            "cmcs_final",
+            "ml_risk_probability",
+        ]
+    ].sort_values("cmcs_final", ascending=False)
+    avoided_path = REPORT_OUTPUT_DIR / "actual_route_avoided_segments.csv"
+    avoided.to_csv(avoided_path, index=False, encoding="utf-8-sig")
+    map_path = create_actual_route_map(
+        optimizer.G, routes, endpoints
+    )
+    endpoint_path = REPORT_OUTPUT_DIR / "actual_route_endpoints.json"
+    endpoint_path.write_text(
+        json.dumps(endpoints, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {
+        "endpoints": endpoints,
+        "shortest": shortest,
+        "safest": safest,
+        "balanced": balanced,
+        "comparison": comparison,
+        "pareto": pareto,
+        "map_path": map_path,
+        "comparison_path": comparison_path,
+        "pareto_path": pareto_path,
+        "pareto_chart_path": pareto_chart_path,
+        "avoided_path": avoided_path,
+        "endpoint_path": endpoint_path,
+    }
+
+
+def run_full_pipeline(
+    data_dir: str | Path = "data",
+    refresh_data: bool = False,
+    refresh_network: bool = False,
+) -> dict[str, object]:
+    ensure_directories()
+    collected = collect_available_real_data(refresh=refresh_data)
+    graph = build_or_load_walk_graph(refresh=refresh_network)
+    edge_features, graph = build_edge_feature_table(graph, data_dir=data_dir)
+    segment_scores, model_report = train_edge_risk_model(edge_features)
+    score_columns = segment_scores[
+        ["segment_id", "cmcs", "cmcs_final", "ml_risk_probability"]
+    ]
+    final_edges = edge_features.drop(
+        columns=["cmcs_final", "ml_risk_probability"], errors="ignore"
+    ).merge(score_columns, on=["segment_id", "cmcs"], how="left")
+    final_edges.to_csv(EDGE_CMCS_PATH, index=False, encoding="utf-8-sig")
+    graph = apply_scores_to_graph(graph, segment_scores)
+    risk_map_path = create_city_risk_map(segment_scores)
+    district_summary, district_chart_path = create_district_safety_outputs(
+        segment_scores
+    )
+    route_result = run_actual_route_recommendation(
+        graph, final_edges, data_dir=data_dir
+    )
+
+    report = {
+        "status": "completed",
+        "data_counts": collected,
+        "graph": {
+            "nodes": graph.number_of_nodes(),
+            "directed_edges": graph.number_of_edges(),
+            "unique_segments": int(final_edges["segment_id"].nunique()),
+        },
+        "cmcs": {
+            "mean": round(float(final_edges["cmcs_final"].mean()), 6),
+            "median": round(float(final_edges["cmcs_final"].median()), 6),
+            "high_risk_edge_count": int(
+                (final_edges["cmcs_final"] >= 0.6).sum()
+            ),
+        },
+        "model": model_report,
+        "route": {
+            "origin": route_result["endpoints"]["origin_name"],
+            "destination": route_result["endpoints"]["destination_name"],
+            "shortest_distance_m": route_result["shortest"][
+                "total_distance_m"
+            ],
+            "safest_distance_m": route_result["safest"]["total_distance_m"],
+            "shortest_average_cmcs": route_result["shortest"][
+                "average_cmcs"
+            ],
+            "safest_average_cmcs": route_result["safest"]["average_cmcs"],
+            "risk_reduction_pct": round(
+                (
+                    route_result["shortest"]["total_cmcs"]
+                    - route_result["safest"]["total_cmcs"]
+                )
+                / route_result["shortest"]["total_cmcs"]
+                * 100
+                if route_result["shortest"]["total_cmcs"] > 0
+                else 0,
+                2,
+            ),
+            "avoided_segment_count": int(
+                len(
+                    pd.read_csv(
+                        route_result["avoided_path"],
+                        encoding="utf-8-sig",
+                    )
+                )
+            ),
+        },
+        "artifacts": {
+            "edge_features": str(EDGE_FEATURE_PATH),
+            "edge_cmcs": str(EDGE_CMCS_PATH),
+            "scored_graph": str(SCORED_GRAPH_PATH),
+            "edge_model": str(EDGE_MODEL_PATH),
+            "route_map": str(route_result["map_path"]),
+            "route_comparison": str(route_result["comparison_path"]),
+            "city_risk_map": str(risk_map_path),
+            "route_pareto_chart": str(route_result["pareto_chart_path"]),
+            "avoided_segments": str(route_result["avoided_path"]),
+            "district_summary": str(
+                REPORT_OUTPUT_DIR / "district_safety_summary.csv"
+            ),
+            "district_radar": str(district_chart_path),
+        },
+    }
+    FULL_PIPELINE_REPORT_PATH.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report
