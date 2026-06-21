@@ -1,0 +1,40 @@
+services:
+  api:
+    build: .
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data:ro          # 데이터는 읽기 전용 마운트
+      - ./models:/app/models:ro
+      - ./outputs:/app/outputs
+      - ./cache:/app/cache
+    environment:
+      - CMCS_GRAPH_PATH=${CMCS_GRAPH_PATH:-/app/data/graph/daejeon_walk_cmcs.graphml}
+      - CMCS_EDGE_PATH=${CMCS_EDGE_PATH:-/app/data/processed/daejeon_edge_cmcs.csv}
+      - DATA_GO_KR_API_KEY=${DATA_GO_KR_API_KEY:-}
+      - KAKAO_API_KEY=${KAKAO_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+  # 데이터 갱신 스케줄러 (선택적으로 실행)
+  scheduler:
+    build: .
+    command: python scripts/refresh_data.py
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+      - ./cache:/app/cache
+    environment:
+      - DATA_GO_KR_API_KEY=${DATA_GO_KR_API_KEY:-}
+      - KAKAO_API_KEY=${KAKAO_API_KEY:-}
+      - REFRESH_INTERVAL_HOURS=${REFRESH_INTERVAL_HOURS:-24}
+    profiles: ["scheduler"]   # docker compose --profile scheduler up 으로만 실행
+    restart: unless-stopped

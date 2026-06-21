@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CMCS 어린이 안전 통학 경로</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Noto Sans KR', sans-serif; background: #f8f9fa; }
+  #header { background: #1e40af; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 12px; }
+  #header h1 { font-size: 1.1rem; font-weight: 700; }
+  #header .badge { background: #fbbf24; color: #1e3a8a; font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; font-weight: 700; }
+  #layout { display: flex; height: calc(100vh - 50px); }
+  #sidebar { width: 320px; min-width: 280px; background: #fff; overflow-y: auto; padding: 16px; border-right: 1px solid #e5e7eb; }
+  #map { flex: 1; }
+  label { font-size: 0.78rem; font-weight: 600; color: #374151; margin-bottom: 4px; display: block; }
+  input, select { width: 100%; padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 0.84rem; margin-bottom: 10px; }
+  input:focus, select:focus { outline: none; border-color: #3b82f6; }
+  .btn { width: 100%; padding: 9px; background: #1e40af; color: #fff; border: none; border-radius: 6px; font-size: 0.9rem; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+  .btn:hover { background: #1d4ed8; }
+  .btn-secondary { background: #6b7280; }
+  .btn-secondary:hover { background: #4b5563; }
+  .result-box { background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px; padding: 12px; margin-top: 12px; font-size: 0.82rem; }
+  .result-box h3 { font-size: 0.9rem; color: #0369a1; margin-bottom: 8px; }
+  .row { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid #e0f2fe; }
+  .row:last-child { border-bottom: none; }
+  .warn { color: #b45309; font-weight: 600; }
+  .disclaimer { font-size: 0.72rem; color: #6b7280; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 6px; padding: 8px; margin-top: 10px; }
+  .section-title { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; color: #9ca3af; margin: 14px 0 6px; letter-spacing: 0.05em; }
+  .autocomplete-list { list-style: none; border: 1px solid #d1d5db; border-top: none; border-radius: 0 0 6px 6px; max-height: 160px; overflow-y: auto; background: #fff; position: absolute; z-index: 9999; width: 288px; }
+  .autocomplete-list li { padding: 8px 10px; font-size: 0.82rem; cursor: pointer; }
+  .autocomplete-list li:hover { background: #eff6ff; }
+  .ac-wrap { position: relative; }
+  @media (max-width: 600px) {
+    #layout { flex-direction: column; }
+    #sidebar { width: 100%; height: 55vh; min-width: unset; }
+    #map { height: 45vh; }
+  }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>🏫 CMCS 어린이 안전 통학 경로</h1>
+  <span class="badge">대전 대상</span>
+</div>
+<div id="layout">
+  <div id="sidebar">
+    <div class="section-title">출발지</div>
+    <div class="ac-wrap">
+      <label for="origin-input">학교 이름 또는 클릭으로 선택</label>
+      <input id="origin-input" type="text" placeholder="예: 유성초등학교" autocomplete="off">
+      <ul id="origin-list" class="autocomplete-list" style="display:none"></ul>
+    </div>
+    <div style="font-size:0.75rem;color:#6b7280;margin:-6px 0 8px">
+      또는 지도를 클릭해 출발지 설정 <span id="origin-coord"></span>
+    </div>
+
+    <div class="section-title">도착지</div>
+    <div class="ac-wrap">
+      <label for="dest-input">학원 이름 또는 클릭으로 선택</label>
+      <input id="dest-input" type="text" placeholder="예: 한솔수학학원" autocomplete="off">
+      <ul id="dest-list" class="autocomplete-list" style="display:none"></ul>
+    </div>
+    <div style="font-size:0.75rem;color:#6b7280;margin:-6px 0 8px">
+      또는 지도를 클릭해 도착지 설정 <span id="dest-coord"></span>
+    </div>
+
+    <div class="section-title">옵션</div>
+    <label>경로 모드</label>
+    <select id="mode">
+      <option value="balanced">균형 (거리+안전)</option>
+      <option value="safest">최안전</option>
+      <option value="shortest">최단거리</option>
+    </select>
+    <label>연령대</label>
+    <select id="age">
+      <option value="low">초등 1-2학년 (안전 최우선)</option>
+      <option value="mid" selected>초등 3-4학년 (균형)</option>
+      <option value="high">초등 5-6학년</option>
+      <option value="middle">중학생</option>
+    </select>
+    <label>출발 시각</label>
+    <select id="hour">
+      <option value="7">07:00 (등교)</option>
+      <option value="8" selected>08:00 (등교 러시)</option>
+      <option value="13">13:00 (낮)</option>
+      <option value="16">16:00 (하교 러시)</option>
+      <option value="21">21:00 (야간)</option>
+    </select>
+
+    <button class="btn" onclick="findRoute()">경로 찾기</button>
+    <button class="btn btn-secondary" onclick="resetAll()">초기화</button>
+
+    <div id="result"></div>
+    <div class="disclaimer">
+      ⚠️ 이 서비스는 통계 모델 기반 <strong>참고용</strong>입니다. 실제 도로 상황과 다를 수 있으며, 보호자의 판단을 대체하지 않습니다.
+    </div>
+  </div>
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const API = '';
+const MAP_CENTER = [36.35, 127.38];
+const map = L.map('map').setView(MAP_CENTER, 13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap contributors', maxZoom: 19
+}).addTo(map);
+
+let originMarker = null, destMarker = null, routeLayer = null;
+let originCoord = null, destCoord = null;
+let pickingFor = null;  // 'origin' | 'dest'
+
+// 지도 클릭 → 좌표 선택
+map.on('click', (e) => {
+  const { lat, lng } = e.latlng;
+  if (!originCoord) setOriginCoord(lat, lng);
+  else if (!destCoord) setDestCoord(lat, lng);
+});
+
+function setOriginCoord(lat, lon) {
+  originCoord = { lat, lon };
+  document.getElementById('origin-coord').textContent = `(${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+  if (originMarker) map.removeLayer(originMarker);
+  originMarker = L.marker([lat, lon], { title: '출발지' }).addTo(map).bindPopup('출발지').openPopup();
+}
+function setDestCoord(lat, lon) {
+  destCoord = { lat, lon };
+  document.getElementById('dest-coord').textContent = `(${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+  if (destMarker) map.removeLayer(destMarker);
+  destMarker = L.marker([lat, lon], { title: '도착지', icon: redIcon() }).addTo(map).bindPopup('도착지').openPopup();
+}
+
+function redIcon() {
+  return L.icon({ iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png', shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png', iconSize: [25, 41], iconAnchor: [12, 41] });
+}
+
+// 자동완성
+function setupAutocomplete(inputId, listId, endpoint) {
+  const input = document.getElementById(inputId);
+  const list = document.getElementById(listId);
+  let timer;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (!q) { list.style.display = 'none'; return; }
+    timer = setTimeout(async () => {
+      const res = await fetch(`${API}/search/${endpoint}?q=${encodeURIComponent(q)}`).catch(() => null);
+      if (!res || !res.ok) return;
+      const items = await res.json();
+      list.innerHTML = '';
+      if (!items.length) { list.style.display = 'none'; return; }
+      items.forEach(item => {
+        const li = document.createElement('li');
+        li.textContent = `${item.name} — ${item.district ?? ''}`;
+        li.onclick = () => {
+          input.value = item.name;
+          list.style.display = 'none';
+          if (item.lat && item.lon) {
+            if (inputId === 'origin-input') setOriginCoord(item.lat, item.lon);
+            else setDestCoord(item.lat, item.lon);
+          }
+        };
+        list.appendChild(li);
+      });
+      list.style.display = 'block';
+    }, 250);
+  });
+  document.addEventListener('click', (e) => { if (!input.contains(e.target)) list.style.display = 'none'; });
+}
+setupAutocomplete('origin-input', 'origin-list', 'schools');
+setupAutocomplete('dest-input', 'dest-list', 'academies');
+
+async function findRoute() {
+  if (!originCoord || !destCoord) {
+    alert('출발지와 도착지를 모두 지정해 주세요.');
+    return;
+  }
+  const body = {
+    origin: { lat: originCoord.lat, lon: originCoord.lon },
+    destination: { lat: destCoord.lat, lon: destCoord.lon },
+    mode: document.getElementById('mode').value,
+    age_group: document.getElementById('age').value,
+    hour: parseInt(document.getElementById('hour').value),
+  };
+  document.getElementById('result').innerHTML = '<div style="padding:10px;color:#6b7280">경로 계산 중...</div>';
+  const res = await fetch(`${API}/route/recommend`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }).catch(() => null);
+  if (!res) { showError('서버에 연결할 수 없습니다.'); return; }
+  if (!res.ok) { const e = await res.json(); showError(e.detail || '오류 발생'); return; }
+  const data = await res.json();
+  showResult(data);
+}
+
+function showResult(d) {
+  const exceeded = d.detour_exceeded ? `<span class="warn">⚠️ 우회율 초과 (${d.detour_ratio}x)</span>` : `${d.detour_ratio}x`;
+  document.getElementById('result').innerHTML = `
+    <div class="result-box">
+      <h3>📍 ${d.mode} · ${d.age_group} · ${d.time_label}</h3>
+      <div class="row"><span>총 거리</span><span>${d.total_distance_m.toFixed(0)}m</span></div>
+      <div class="row"><span>평균 위험도(CMCS)</span><span>${d.average_cmcs.toFixed(3)}</span></div>
+      <div class="row"><span>위험 감소</span><span>${d.risk_reduction_pct != null ? d.risk_reduction_pct.toFixed(1) + '%' : '-'}</span></div>
+      <div class="row"><span>우회율</span><span>${exceeded}</span></div>
+      <div class="row"><span>구간 수</span><span>${d.num_segments}</span></div>
+    </div>`;
+}
+function showError(msg) {
+  document.getElementById('result').innerHTML = `<div style="color:#dc2626;padding:8px;font-size:0.82rem">❌ ${msg}</div>`;
+}
+function resetAll() {
+  if (originMarker) { map.removeLayer(originMarker); originMarker = null; }
+  if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+  if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
+  originCoord = destCoord = null;
+  document.getElementById('origin-coord').textContent = '';
+  document.getElementById('dest-coord').textContent = '';
+  document.getElementById('origin-input').value = '';
+  document.getElementById('dest-input').value = '';
+  document.getElementById('result').innerHTML = '';
+}
+</script>
+</body>
+</html>

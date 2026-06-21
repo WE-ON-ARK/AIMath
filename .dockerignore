@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.DS_Store
+.env
+.git/
+.github/
+
+# 대용량 데이터 — 볼륨으로 마운트
+data/graph/daejeon_walk*.graphml
+data/processed/daejeon_edge_*.csv
+
+# 개발 산출물
+outputs/
+cache/
