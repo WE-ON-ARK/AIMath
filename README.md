@@ -22,7 +22,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,viz]"
 python main.py demo
-pytest  # 테스트 70개 실행
+pytest  # 테스트 75개 실행
 ```
 
 데모 산출물은 다음 위치에 생성됩니다.
@@ -78,9 +78,17 @@ python main.py full-pipeline
 4. OSM 도로 등급, 제한속도, 차로, 보도, 조명 태그 기반 프록시 생성
 5. AHP CMCS 계산
 6. 2km 공간 그룹 교차검증을 적용한 도로 사고 위험 모델 학습
-7. 검증 성능에 따라 AHP와 ML 위험 확률을 자동 혼합
-8. 대전문정초등학교에서 실제 둔산 지역 학원까지 최단·안전·균형 경로 산출
-9. 경로 비교 CSV, 파레토 데이터, HTML 지도, 모델·종합 리포트 저장
+7. LogisticRegression 기준선과 RandomForest·XGBoost를 동일 Fold로 비교
+8. OOF Average Precision 우선, ROC-AUC 차순으로 RF/XGBoost 최종 모델 선정
+9. OOF F1 최적 임계값과 고정 0.5 임계값 성능을 함께 저장
+10. 자치구 경계로 분리한 1.5km 통학 권역 XGBoost를 구별 홀드아웃으로 검증
+11. 권역 OOF F1 0.5 이상일 때 권역 위험 확률을 도로 CMCS에 혼합
+12. 대전문정초등학교에서 실제 둔산 지역 학원까지 최단·안전·균형 경로 산출
+13. 경로 비교 CSV, 파레토 데이터, HTML 지도, 모델·종합 리포트 저장
+
+F1 0.5 목표는 희소한 사고 다발지역 라벨을 그대로 복제하거나 음성 표본을
+임의 축소하지 않고, 1.5km 통학 위험 권역 분류 문제로 계층화해 평가합니다.
+보고서에는 도로 단위 모델과 권역 단위 XGBoost 지표를 분리해 저장합니다.
 
 주요 결과:
 
@@ -89,15 +97,22 @@ data/processed/daejeon_edge_features.csv
 data/processed/daejeon_edge_cmcs.csv
 data/graph/daejeon_walk_cmcs.graphml
 models/edge_accident_risk_model.pkl
+models/regional_xgboost_risk_model.pkl
 outputs/maps/actual_safe_route.html
 outputs/maps/daejeon_cmcs_risk_map.html
 outputs/reports/actual_route_comparison.csv
 outputs/reports/actual_route_pareto.csv
 outputs/reports/actual_route_avoided_segments.csv
 outputs/reports/edge_model_report.json
+outputs/reports/edge_model_leaderboard.csv
+outputs/reports/edge_model_validation_predictions.csv
+outputs/reports/regional_boosting_report.json
+outputs/reports/regional_boosting_predictions.csv
 outputs/reports/full_pipeline_report.json
 outputs/charts/edge_model_roc_pr.png
 outputs/charts/edge_model_explainability.png
+outputs/charts/regional_boosting_roc_pr.png
+outputs/charts/regional_boosting_shap.png
 outputs/charts/actual_route_pareto.html
 outputs/charts/district_safety_radar.html
 ```
@@ -106,6 +121,12 @@ outputs/charts/district_safety_radar.html
 
 ```bash
 python main.py full-pipeline --refresh-data --refresh-network
+```
+
+도로 피처가 이미 생성된 상태에서 모델 비교·학습만 다시 실행할 수도 있습니다.
+
+```bash
+python main.py train-edge-models
 ```
 
 ## 실제 데이터 연동
@@ -206,7 +227,7 @@ api/
   main.py                 # FastAPI 앱 및 라우터
 static/
   index.html              # Leaflet.js 기반 웹 UI
-tests/                    # 테스트 70개
+tests/                    # 테스트 75개
 main.py
 config.py
 ```
@@ -230,7 +251,7 @@ python -c "from src.model_validation import run_full_model_validation; run_full_
 
 ## 다음 개발 단계
 
-- 공공데이터 API 키 발급 후 실 데이터로 전체 파이프라인 재실행
+- 공공데이터 API와 OSM 원천 데이터의 정기 갱신 자동화
 - 가로등 실측 데이터 확보 (현재 OSM 희박 — 7개 포인트)
 - 사고 이력 데이터 보강 (현재 22건 → 통계 신뢰도 제한)
 - 클라우드(GCP/AWS) 배포 및 모바일 UI 연동

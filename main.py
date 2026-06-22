@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import argparse
 
-from config import GRAPH_DATA_DIR, SETTINGS, ensure_directories
+from config import (
+    GRAPH_DATA_DIR,
+    PROCESSED_DATA_DIR,
+    SETTINGS,
+    ensure_directories,
+)
 from src.data_collector import DataCollector, build_pedestrian_network
 from src.demo import run_demo
-from src.full_pipeline import run_full_pipeline
+from src.full_pipeline import (
+    EDGE_FEATURE_PATH,
+    run_full_pipeline,
+    train_edge_risk_model,
+    train_regional_boosting_model,
+)
 from src.real_data_pipeline import run_real_data_pipeline
 
 
@@ -45,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     )
     full_parser.add_argument("--refresh-data", action="store_true")
     full_parser.add_argument("--refresh-network", action="store_true")
+
+    train_parser = subparsers.add_parser(
+        "train-edge-models",
+        help="기존 도로 피처로 RandomForest·XGBoost 공간 교차검증 및 최종 학습",
+    )
+    train_parser.add_argument(
+        "--edge-features", default=str(EDGE_FEATURE_PATH)
+    )
     return parser.parse_args()
 
 
@@ -112,9 +130,11 @@ def main() -> None:
             refresh_network=args.refresh_network,
         )
         route = report["route"]
-        model = report["model"]
-        best_model = model["best_model"]
-        metrics = model["models"][best_model]
+        edge_model = report["edge_model"]
+        best_model = edge_model["best_model"]
+        edge_metrics = edge_model["models"][best_model]
+        regional_model = report["regional_boosting_model"]
+        regional_metrics = regional_model["metrics"]["optimized_threshold"]
         print("\nCMCS 전체 파이프라인 완료")
         print(
             f"도로망: 노드 {report['graph']['nodes']:,}, "
@@ -123,10 +143,17 @@ def main() -> None:
         )
         print(
             f"도로 위험 모델: {best_model}, "
-            f"ROC-AUC={metrics['roc_auc']:.3f}, "
-            f"AP={metrics['average_precision']:.3f}, "
-            f"연구검증={model['research_validation_passed']}, "
-            f"운영배포={model['production_deployment_ready']}"
+            f"ROC-AUC={edge_metrics['roc_auc']:.3f}, "
+            f"AP={edge_metrics['average_precision']:.3f}, "
+            f"연구검증={edge_model['research_validation_passed']}, "
+            f"운영배포={edge_model['production_deployment_ready']}"
+        )
+        print(
+            f"권역 부스팅: XGBoost, "
+            f"F1={regional_metrics['f1']:.3f}, "
+            f"Precision={regional_metrics['precision']:.3f}, "
+            f"Recall={regional_metrics['recall']:.3f}, "
+            f"목표달성={regional_model['f1_target_achieved']}"
         )
         print(
             f"실제 경로: {route['origin']} → {route['destination']}, "
@@ -135,6 +162,51 @@ def main() -> None:
             f"위험노출 감소 {route['risk_reduction_pct']:.1f}%"
         )
         print(f"지도: {report['artifacts']['route_map']}")
+    elif command == "train-edge-models":
+        import pandas as pd
+
+        edge_features = pd.read_csv(args.edge_features)
+        segment_scores, report = train_edge_risk_model(edge_features)
+        segment_scores, regional_report = train_regional_boosting_model(
+            segment_scores
+        )
+        score_path = PROCESSED_DATA_DIR / "edge_model_segment_scores.csv"
+        segment_scores.to_csv(
+            score_path, index=False, encoding="utf-8-sig"
+        )
+        leaderboard = pd.DataFrame(
+            [
+                {
+                    "model": name,
+                    "roc_auc": metrics["roc_auc"],
+                    "average_precision": metrics["average_precision"],
+                    "brier_score": metrics["brier_score"],
+                    "optimized_threshold": metrics[
+                        "optimized_threshold"
+                    ]["threshold"],
+                    "optimized_f1": metrics["optimized_threshold"]["f1"],
+                }
+                for name, metrics in report["models"].items()
+            ]
+        ).sort_values(
+            ["average_precision", "roc_auc"], ascending=False
+        )
+        print("\n도로 위험 모델 비교 학습 완료")
+        print(leaderboard.to_string(index=False))
+        print(
+            f"\n최종 트리 모델: {report['best_model']} / "
+            f"임계값 {report['selected_decision_threshold']:.4f}"
+        )
+        regional_metrics = regional_report["metrics"]["optimized_threshold"]
+        print(
+            f"권역 XGBoost: F1={regional_metrics['f1']:.4f}, "
+            f"Precision={regional_metrics['precision']:.4f}, "
+            f"Recall={regional_metrics['recall']:.4f}, "
+            f"목표달성={regional_report['f1_target_achieved']}"
+        )
+        print(f"모델: models/edge_accident_risk_model.pkl")
+        print(f"권역 모델: models/regional_xgboost_risk_model.pkl")
+        print(f"구간 점수: {score_path}")
 
 
 if __name__ == "__main__":

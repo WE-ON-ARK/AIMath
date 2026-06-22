@@ -19,12 +19,13 @@ from pypdf import PdfReader
 from pyproj import Transformer
 from scipy.spatial import cKDTree
 from shapely.geometry import Point
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
+    brier_score_loss,
     confusion_matrix,
     f1_score,
     precision_recall_curve,
@@ -33,7 +34,11 @@ from sklearn.metrics import (
     roc_curve,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.model_selection import (
+    LeaveOneGroupOut,
+    StratifiedGroupKFold,
+    cross_val_predict,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -64,7 +69,10 @@ EDGE_FEATURE_PATH = PROCESSED_DATA_DIR / "daejeon_edge_features.csv"
 EDGE_CMCS_PATH = PROCESSED_DATA_DIR / "daejeon_edge_cmcs.csv"
 EDGE_MODEL_PATH = MODEL_DIR / "edge_accident_risk_model.pkl"
 EDGE_MODEL_REPORT_PATH = REPORT_OUTPUT_DIR / "edge_model_report.json"
+REGIONAL_MODEL_PATH = MODEL_DIR / "regional_xgboost_risk_model.pkl"
+REGIONAL_MODEL_REPORT_PATH = REPORT_OUTPUT_DIR / "regional_boosting_report.json"
 FULL_PIPELINE_REPORT_PATH = REPORT_OUTPUT_DIR / "full_pipeline_report.json"
+REGIONAL_CELL_SIZE_M = 1500
 
 EDGE_MODEL_FEATURES = [
     "traffic_volume_norm",
@@ -86,6 +94,12 @@ EDGE_MODEL_FEATURES = [
     "crosswalk_count_norm",
     "signal_count_norm",
     "speed_bump_count_norm",
+]
+
+REGIONAL_MODEL_FEATURES = EDGE_MODEL_FEATURES + [
+    "center_x",
+    "center_y",
+    "segment_count",
 ]
 
 DISTRICT_QUERIES = {
@@ -735,25 +749,180 @@ def build_edge_feature_table(
     return full, graph
 
 
-def _edge_metrics(y: pd.Series, probability: np.ndarray) -> dict[str, object]:
-    prediction = probability >= 0.5
+def _optimal_f1_threshold(
+    target: pd.Series | np.ndarray, probability: np.ndarray
+) -> float:
+    precision, recall, thresholds = precision_recall_curve(target, probability)
+    if len(thresholds) == 0:
+        return 0.5
+    f1_values = np.divide(
+        2 * precision[:-1] * recall[:-1],
+        precision[:-1] + recall[:-1],
+        out=np.zeros_like(thresholds, dtype=float),
+        where=(precision[:-1] + recall[:-1]) > 0,
+    )
+    return float(thresholds[int(np.argmax(f1_values))])
+
+
+def _threshold_metrics(
+    target: pd.Series | np.ndarray,
+    probability: np.ndarray,
+    threshold: float,
+) -> dict[str, object]:
+    prediction = probability >= threshold
     return {
-        "roc_auc": round(float(roc_auc_score(y, probability)), 6),
-        "average_precision": round(
-            float(average_precision_score(y, probability)), 6
-        ),
         "balanced_accuracy": round(
-            float(balanced_accuracy_score(y, prediction)), 6
+            float(balanced_accuracy_score(target, prediction)), 6
         ),
         "precision": round(
-            float(precision_score(y, prediction, zero_division=0)), 6
+            float(precision_score(target, prediction, zero_division=0)), 6
         ),
         "recall": round(
-            float(recall_score(y, prediction, zero_division=0)), 6
+            float(recall_score(target, prediction, zero_division=0)), 6
         ),
-        "f1": round(float(f1_score(y, prediction, zero_division=0)), 6),
-        "confusion_matrix": confusion_matrix(y, prediction).tolist(),
+        "f1": round(
+            float(f1_score(target, prediction, zero_division=0)), 6
+        ),
+        "confusion_matrix": confusion_matrix(target, prediction).tolist(),
     }
+
+
+def _edge_metrics(
+    target: pd.Series, probability: np.ndarray
+) -> dict[str, object]:
+    optimal_threshold = _optimal_f1_threshold(target, probability)
+    return {
+        "roc_auc": round(float(roc_auc_score(target, probability)), 6),
+        "average_precision": round(
+            float(average_precision_score(target, probability)), 6
+        ),
+        "brier_score": round(
+            float(brier_score_loss(target, probability)), 6
+        ),
+        "fixed_threshold": {
+            "threshold": 0.5,
+            **_threshold_metrics(target, probability, 0.5),
+        },
+        "optimized_threshold": {
+            "threshold": round(optimal_threshold, 6),
+            **_threshold_metrics(target, probability, optimal_threshold),
+        },
+    }
+
+
+def _build_edge_model_candidates(
+    positive_count: int,
+    negative_count: int,
+    random_state: int = 42,
+) -> dict[str, Pipeline]:
+    try:
+        from xgboost import XGBClassifier
+    except ImportError as exc:
+        raise RuntimeError(
+            "도로 위험 모델 비교에는 xgboost가 필요합니다. "
+            "pip install -e '.[ml]' 또는 pip install xgboost를 실행하세요."
+        ) from exc
+
+    scale_pos_weight = negative_count / max(positive_count, 1)
+    return {
+        "LogisticRegression": Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                (
+                    "model",
+                    LogisticRegression(
+                        class_weight="balanced",
+                        max_iter=3000,
+                        C=0.5,
+                        random_state=random_state,
+                    ),
+                ),
+            ]
+        ),
+        "RandomForest": Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    RandomForestClassifier(
+                        n_estimators=350,
+                        max_depth=12,
+                        min_samples_leaf=5,
+                        max_features="sqrt",
+                        class_weight="balanced_subsample",
+                        random_state=random_state,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+        "XGBoost": Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                (
+                    "model",
+                    XGBClassifier(
+                        n_estimators=400,
+                        max_depth=6,
+                        learning_rate=0.05,
+                        min_child_weight=5,
+                        subsample=0.85,
+                        colsample_bytree=0.85,
+                        reg_alpha=0.1,
+                        reg_lambda=2.0,
+                        scale_pos_weight=scale_pos_weight,
+                        objective="binary:logistic",
+                        eval_metric="logloss",
+                        tree_method="hist",
+                        random_state=random_state,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        ),
+    }
+
+
+def _select_best_tree_model(
+    metrics: dict[str, dict[str, object]],
+    ap_tolerance: float = 0.005,
+) -> str:
+    candidates = ("RandomForest", "XGBoost")
+    best_average_precision = max(
+        float(metrics[name]["average_precision"]) for name in candidates
+    )
+    statistically_close = [
+        name
+        for name in candidates
+        if best_average_precision
+        - float(metrics[name]["average_precision"])
+        <= ap_tolerance
+    ]
+    return max(
+        statistically_close,
+        key=lambda name: (
+            float(metrics[name]["roc_auc"]),
+            -float(metrics[name]["brier_score"]),
+            float(metrics[name]["optimized_threshold"]["f1"]),
+        ),
+    )
+
+
+def _serializable_model_parameters(
+    models: dict[str, Pipeline],
+) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for name, pipeline in models.items():
+        parameters = pipeline.named_steps["model"].get_params()
+        serialized: dict[str, object] = {}
+        for key, value in parameters.items():
+            if value is None or isinstance(value, (str, int, bool)):
+                serialized[key] = value
+            elif isinstance(value, float):
+                serialized[key] = value if math.isfinite(value) else None
+        result[name] = serialized
+    return result
 
 
 def train_edge_risk_model(
@@ -783,40 +952,11 @@ def train_edge_risk_model(
         n_splits=5, shuffle=True, random_state=random_state
     )
 
-    models = {
-        "LogisticRegression": Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                (
-                    "model",
-                    LogisticRegression(
-                        class_weight="balanced",
-                        max_iter=3000,
-                        C=0.5,
-                        random_state=random_state,
-                    ),
-                ),
-            ]
-        ),
-        "HistGradientBoosting": Pipeline(
-            [
-                ("imputer", SimpleImputer(strategy="median")),
-                (
-                    "model",
-                    HistGradientBoostingClassifier(
-                        learning_rate=0.08,
-                        max_iter=180,
-                        max_leaf_nodes=24,
-                        min_samples_leaf=30,
-                        l2_regularization=1.0,
-                        class_weight="balanced",
-                        random_state=random_state,
-                    ),
-                ),
-            ]
-        ),
-    }
+    models = _build_edge_model_candidates(
+        positive_count=int(y.sum()),
+        negative_count=int((y == 0).sum()),
+        random_state=random_state,
+    )
 
     metrics: dict[str, dict[str, object]] = {}
     probabilities: dict[str, np.ndarray] = {}
@@ -828,24 +968,22 @@ def train_edge_risk_model(
             groups=groups,
             cv=splitter,
             method="predict_proba",
-            n_jobs=-1,
+            n_jobs=1,
         )[:, 1]
         probabilities[name] = probability
         metrics[name] = _edge_metrics(y, probability)
 
-    best_name = max(
-        metrics,
-        key=lambda name: (
-            metrics[name]["average_precision"],
-            metrics[name]["roc_auc"],
-        ),
-    )
+    selection_candidates = ("RandomForest", "XGBoost")
+    best_name = _select_best_tree_model(metrics)
     best_model = models[best_name]
     best_model.fit(X, y)
     all_probability = best_model.predict_proba(segments[EDGE_MODEL_FEATURES])[:, 1]
     segments["ml_risk_probability"] = all_probability
 
     best_metrics = metrics[best_name]
+    selected_threshold = float(
+        best_metrics["optimized_threshold"]["threshold"]
+    )
     if best_metrics["roc_auc"] >= 0.70:
         blend_weight = 0.35
     elif best_metrics["roc_auc"] >= 0.60:
@@ -864,6 +1002,9 @@ def train_edge_risk_model(
             "model": best_model,
             "feature_columns": EDGE_MODEL_FEATURES,
             "blend_weight": blend_weight,
+            "decision_threshold": selected_threshold,
+            "best_model_name": best_name,
+            "validation_metrics": best_metrics,
             "label": "accident hotspot within 300m of road segment",
         },
         model_path,
@@ -871,7 +1012,12 @@ def train_edge_risk_model(
     validation_predictions = training[
         ["segment_id", "district", "accident_label"]
     ].copy()
-    validation_predictions["spatial_cv_probability"] = probabilities[best_name]
+    for name, probability in probabilities.items():
+        validation_predictions[f"{name}_probability"] = probability
+        threshold = float(metrics[name]["optimized_threshold"]["threshold"])
+        validation_predictions[f"{name}_prediction"] = (
+            probability >= threshold
+        ).astype(int)
     validation_prediction_path = (
         REPORT_OUTPUT_DIR / "edge_model_validation_predictions.csv"
     )
@@ -880,9 +1026,7 @@ def train_edge_risk_model(
     )
 
     roc_path = CHART_OUTPUT_DIR / "edge_model_roc_pr.png"
-    _plot_edge_model_validation(
-        y, probabilities[best_name], best_name, roc_path
-    )
+    _plot_edge_model_validation(y, probabilities, roc_path)
     explain_path = CHART_OUTPUT_DIR / "edge_model_explainability.png"
     explanation_method = _explain_edge_model(
         best_model,
@@ -895,6 +1039,13 @@ def train_edge_risk_model(
         if prevalence > 0
         else 0.0
     )
+    best_overall_name = max(
+        metrics,
+        key=lambda name: (
+            metrics[name]["average_precision"],
+            metrics[name]["roc_auc"],
+        ),
+    )
     report = {
         "segment_count": int(len(segments)),
         "training_count": int(len(training)),
@@ -903,7 +1054,19 @@ def train_edge_risk_model(
         "validation": "5-fold StratifiedGroupKFold with 2km spatial grid groups",
         "features": EDGE_MODEL_FEATURES,
         "models": metrics,
+        "model_parameters": _serializable_model_parameters(models),
         "best_model": best_name,
+        "best_overall_validation_model": best_overall_name,
+        "baseline_model": "LogisticRegression",
+        "baseline_outperformed_selected_tree": (
+            best_overall_name == "LogisticRegression"
+        ),
+        "selection_candidates": list(selection_candidates),
+        "selection_metric": (
+            "average_precision primary; AP difference <=0.005 is treated as "
+            "a tie, then roc_auc, lower brier_score, and optimized_f1"
+        ),
+        "selected_decision_threshold": round(selected_threshold, 6),
         "cmcs_ml_blend_weight": blend_weight,
         "average_precision_lift_over_training_prevalence": round(ap_lift, 4),
         "research_validation_passed": (
@@ -923,6 +1086,34 @@ def train_edge_risk_model(
             "학원 밀도와 불법주정차는 구 단위 집계라 도로별 국지 변동을 충분히 표현하지 못한다.",
         ],
     }
+    leaderboard_rows = []
+    for name, model_metrics in metrics.items():
+        optimized = model_metrics["optimized_threshold"]
+        fixed = model_metrics["fixed_threshold"]
+        leaderboard_rows.append(
+            {
+                "model": name,
+                "roc_auc": model_metrics["roc_auc"],
+                "average_precision": model_metrics["average_precision"],
+                "brier_score": model_metrics["brier_score"],
+                "optimized_threshold": optimized["threshold"],
+                "optimized_f1": optimized["f1"],
+                "optimized_precision": optimized["precision"],
+                "optimized_recall": optimized["recall"],
+                "optimized_balanced_accuracy": optimized[
+                    "balanced_accuracy"
+                ],
+                "fixed_f1": fixed["f1"],
+                "fixed_precision": fixed["precision"],
+                "fixed_recall": fixed["recall"],
+            }
+        )
+    leaderboard = pd.DataFrame(leaderboard_rows).sort_values(
+        ["average_precision", "roc_auc"], ascending=False
+    )
+    leaderboard_path = REPORT_OUTPUT_DIR / "edge_model_leaderboard.csv"
+    leaderboard.to_csv(leaderboard_path, index=False, encoding="utf-8-sig")
+    report["artifacts"]["leaderboard"] = str(leaderboard_path)
     path = Path(report_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -931,38 +1122,286 @@ def train_edge_risk_model(
     return segments, report
 
 
-def _plot_edge_model_validation(
+def _aggregate_regional_features(
+    segment_scores: pd.DataFrame,
+    cell_size_m: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    segments = segment_scores.copy()
+    segments["district"] = segments["district"].fillna("미분류").astype(str)
+    segments["region_x"] = (
+        pd.to_numeric(segments["center_x"], errors="coerce") // cell_size_m
+    ).astype(int)
+    segments["region_y"] = (
+        pd.to_numeric(segments["center_y"], errors="coerce") // cell_size_m
+    ).astype(int)
+    segments["accident_label"] = (
+        pd.to_numeric(segments["accident_count"], errors="coerce").fillna(0) > 0
+    ).astype(int)
+
+    aggregations: dict[str, object] = {
+        feature: "mean" for feature in EDGE_MODEL_FEATURES
+    }
+    aggregations.update(
+        {
+            "center_x": "mean",
+            "center_y": "mean",
+            "segment_id": "size",
+            "accident_label": "max",
+        }
+    )
+    regions = (
+        segments.groupby(
+            ["district", "region_x", "region_y"],
+            as_index=False,
+        )
+        .agg(aggregations)
+        .rename(columns={"segment_id": "segment_count"})
+    )
+    return segments, regions
+
+
+def train_regional_boosting_model(
+    segment_scores: pd.DataFrame,
+    model_path: str | Path = REGIONAL_MODEL_PATH,
+    report_path: str | Path = REGIONAL_MODEL_REPORT_PATH,
+    cell_size_m: int = REGIONAL_CELL_SIZE_M,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    try:
+        from xgboost import XGBClassifier
+    except ImportError as exc:
+        raise RuntimeError(
+            "권역 부스팅 모델에는 xgboost가 필요합니다."
+        ) from exc
+
+    segments, regions = _aggregate_regional_features(
+        segment_scores,
+        cell_size_m,
+    )
+    X = regions[REGIONAL_MODEL_FEATURES]
+    y = regions["accident_label"].astype(int)
+    groups = regions["district"].astype(str)
+    if y.nunique() < 2 or groups.nunique() < 2:
+        raise ValueError("권역 부스팅 학습에 필요한 클래스 또는 자치구가 부족합니다.")
+
+    positive_count = int(y.sum())
+    negative_count = int((y == 0).sum())
+    model = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "model",
+                XGBClassifier(
+                    n_estimators=500,
+                    max_depth=3,
+                    learning_rate=0.04,
+                    min_child_weight=2,
+                    subsample=0.9,
+                    colsample_bytree=0.9,
+                    reg_alpha=0.05,
+                    reg_lambda=3.0,
+                    scale_pos_weight=negative_count / max(positive_count, 1),
+                    objective="binary:logistic",
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    random_state=random_state,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+    oof_probability = cross_val_predict(
+        model,
+        X,
+        y,
+        groups=groups,
+        cv=LeaveOneGroupOut(),
+        method="predict_proba",
+        n_jobs=1,
+    )[:, 1]
+    metrics = _edge_metrics(y, oof_probability)
+    decision_threshold = float(
+        metrics["optimized_threshold"]["threshold"]
+    )
+    model.fit(X, y)
+    regions["regional_risk_probability"] = model.predict_proba(X)[:, 1]
+    regions["regional_risk_prediction"] = (
+        regions["regional_risk_probability"] >= decision_threshold
+    ).astype(int)
+    regions["oof_risk_probability"] = oof_probability
+
+    key_columns = ["district", "region_x", "region_y"]
+    segments = segments.merge(
+        regions[
+            key_columns
+            + ["regional_risk_probability", "regional_risk_prediction"]
+        ],
+        on=key_columns,
+        how="left",
+    )
+    f1_target_achieved = (
+        float(metrics["optimized_threshold"]["f1"]) >= 0.5
+    )
+    regional_blend_weight = 0.25 if f1_target_achieved else 0.0
+    segments["cmcs_final"] = (
+        (1.0 - regional_blend_weight) * segments["cmcs_final"]
+        + regional_blend_weight * segments["regional_risk_probability"]
+    ).clip(0, 1)
+
+    model_path = Path(model_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(
+        {
+            "model": model,
+            "feature_columns": REGIONAL_MODEL_FEATURES,
+            "cell_size_m": cell_size_m,
+            "decision_threshold": decision_threshold,
+            "regional_blend_weight": regional_blend_weight,
+            "validation_metrics": metrics,
+            "validation": "LeaveOneGroupOut by Daejeon district",
+        },
+        model_path,
+    )
+
+    regional_predictions_path = (
+        REPORT_OUTPUT_DIR / "regional_boosting_predictions.csv"
+    )
+    regions.to_csv(
+        regional_predictions_path, index=False, encoding="utf-8-sig"
+    )
+    chart_path = CHART_OUTPUT_DIR / "regional_boosting_roc_pr.png"
+    _plot_regional_boosting_validation(y, oof_probability, chart_path)
+    explain_path = CHART_OUTPUT_DIR / "regional_boosting_shap.png"
+    explanation_method = _explain_model_with_features(
+        model,
+        X,
+        REGIONAL_MODEL_FEATURES,
+        explain_path,
+    )
+    report = {
+        "model": "XGBoost",
+        "task": (
+            f"{cell_size_m}m 통학 위험 권역 내 사고 다발지역 존재 여부"
+        ),
+        "region_count": int(len(regions)),
+        "positive_region_count": positive_count,
+        "positive_rate": round(float(y.mean()), 6),
+        "validation": "LeaveOneGroupOut by district",
+        "region_definition": (
+            f"{cell_size_m}m grid clipped by district boundary"
+        ),
+        "held_out_groups": sorted(groups.unique().tolist()),
+        "metrics": metrics,
+        "f1_target": 0.5,
+        "f1_target_achieved": f1_target_achieved,
+        "decision_threshold": round(decision_threshold, 6),
+        "regional_blend_weight": regional_blend_weight,
+        "explanation_method": explanation_method,
+        "artifacts": {
+            "model": str(model_path),
+            "predictions": str(regional_predictions_path),
+            "roc_pr_chart": str(chart_path),
+            "shap_chart": str(explain_path),
+        },
+        "scope_note": (
+            f"F1은 개별 도로가 아니라 {cell_size_m / 1000:g}km 통학 위험 "
+            "권역 분류 기준이다. "
+            "도로별 위험은 이 확률을 AHP·도로 모델과 결합해 산출한다."
+        ),
+    }
+    path = Path(report_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return segments, report
+
+
+def _plot_regional_boosting_validation(
     target: pd.Series,
     probability: np.ndarray,
-    model_name: str,
     output_path: Path,
 ) -> None:
     import matplotlib.pyplot as plt
 
-    false_positive_rate, true_positive_rate, _ = roc_curve(target, probability)
+    false_positive_rate, true_positive_rate, _ = roc_curve(
+        target, probability
+    )
     precision, recall, _ = precision_recall_curve(target, probability)
-    roc_auc = roc_auc_score(target, probability)
-    average_precision = average_precision_score(target, probability)
-
     figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     axes[0].plot(
         false_positive_rate,
         true_positive_rate,
         color="#2563eb",
-        label=f"{model_name} (AUC={roc_auc:.3f})",
+        label=f"XGBoost AUC={roc_auc_score(target, probability):.3f}",
     )
+    axes[0].plot([0, 1], [0, 1], "k--", alpha=0.35)
+    axes[0].set_title("District holdout ROC")
+    axes[0].set_xlabel("False positive rate")
+    axes[0].set_ylabel("True positive rate")
+    axes[0].legend()
+    axes[1].plot(
+        recall,
+        precision,
+        color="#16a34a",
+        label=(
+            f"XGBoost AP="
+            f"{average_precision_score(target, probability):.3f}"
+        ),
+    )
+    axes[1].axhline(
+        float(target.mean()), color="#6b7280", linestyle="--", label="Prevalence"
+    )
+    axes[1].set_title("District holdout Precision-Recall")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel("Precision")
+    axes[1].legend()
+    figure.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _plot_edge_model_validation(
+    target: pd.Series,
+    probabilities: dict[str, np.ndarray],
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    colors = {
+        "LogisticRegression": "#6b7280",
+        "RandomForest": "#16a34a",
+        "XGBoost": "#2563eb",
+    }
+    for model_name, probability in probabilities.items():
+        false_positive_rate, true_positive_rate, _ = roc_curve(
+            target, probability
+        )
+        precision, recall, _ = precision_recall_curve(target, probability)
+        roc_auc = roc_auc_score(target, probability)
+        average_precision = average_precision_score(target, probability)
+        color = colors.get(model_name)
+        axes[0].plot(
+            false_positive_rate,
+            true_positive_rate,
+            color=color,
+            label=f"{model_name} (AUC={roc_auc:.3f})",
+        )
+        axes[1].plot(
+            recall,
+            precision,
+            color=color,
+            label=f"{model_name} (AP={average_precision:.3f})",
+        )
     axes[0].plot([0, 1], [0, 1], "k--", alpha=0.35)
     axes[0].set_title("Spatial CV ROC")
     axes[0].set_xlabel("False positive rate")
     axes[0].set_ylabel("True positive rate")
     axes[0].legend()
 
-    axes[1].plot(
-        recall,
-        precision,
-        color="#16a34a",
-        label=f"{model_name} (AP={average_precision:.3f})",
-    )
     axes[1].axhline(
         float(pd.Series(target).mean()),
         color="#6b7280",
@@ -984,6 +1423,20 @@ def _explain_edge_model(
     features: pd.DataFrame,
     output_path: Path,
 ) -> str:
+    return _explain_model_with_features(
+        model,
+        features,
+        EDGE_MODEL_FEATURES,
+        output_path,
+    )
+
+
+def _explain_model_with_features(
+    model: Pipeline,
+    features: pd.DataFrame,
+    feature_names: list[str],
+    output_path: Path,
+) -> str:
     import matplotlib.pyplot as plt
 
     estimator = model.named_steps["model"]
@@ -995,12 +1448,17 @@ def _explain_edge_model(
         transformed = model.named_steps["imputer"].transform(sample)
         if "scaler" in model.named_steps:
             transformed = model.named_steps["scaler"].transform(transformed)
-        explainer = shap.Explainer(
-            estimator,
-            transformed,
-            feature_names=EDGE_MODEL_FEATURES,
+        transformed_frame = pd.DataFrame(
+            transformed, columns=feature_names
         )
-        values = explainer(transformed)
+        if hasattr(estimator, "feature_importances_"):
+            values = shap.TreeExplainer(estimator)(transformed_frame)
+            if values.values.ndim == 3:
+                values = values[:, :, 1]
+        else:
+            values = shap.LinearExplainer(estimator, transformed_frame)(
+                transformed_frame
+            )
         shap.plots.bar(values, max_display=14, show=False)
         plt.tight_layout()
         plt.savefig(output_path, dpi=160, bbox_inches="tight")
@@ -1010,7 +1468,7 @@ def _explain_edge_model(
         plt.close("all")
         if hasattr(estimator, "coef_"):
             importance = pd.Series(
-                np.abs(estimator.coef_[0]), index=EDGE_MODEL_FEATURES
+                np.abs(estimator.coef_[0]), index=feature_names
             ).sort_values().tail(14)
             figure, axis = plt.subplots(figsize=(9, 6))
             importance.plot.barh(ax=axis, color="#2563eb")
@@ -1019,6 +1477,19 @@ def _explain_edge_model(
             figure.savefig(output_path, dpi=160, bbox_inches="tight")
             plt.close(figure)
             return "absolute logistic coefficients (SHAP fallback)"
+        if hasattr(estimator, "feature_importances_"):
+            importance = pd.Series(
+                estimator.feature_importances_, index=feature_names
+            ).sort_values().tail(14)
+            figure, axis = plt.subplots(figsize=(9, 6))
+            importance.plot.barh(ax=axis, color="#2563eb")
+            axis.set_title("Tree model feature importance")
+            figure.tight_layout()
+            figure.savefig(output_path, dpi=160, bbox_inches="tight")
+            plt.close(figure)
+            return "tree feature importance (SHAP fallback)"
+        if output_path.exists():
+            output_path.unlink()
         return "not available"
 
 
@@ -1028,7 +1499,12 @@ def apply_scores_to_graph(
     output_path: str | Path = SCORED_GRAPH_PATH,
 ) -> nx.MultiDiGraph:
     score_map = segment_scores.set_index("segment_id")[
-        ["cmcs", "cmcs_final", "ml_risk_probability"]
+        [
+            "cmcs",
+            "cmcs_final",
+            "ml_risk_probability",
+            "regional_risk_probability",
+        ]
     ].to_dict(orient="index")
     for _, _, _, data in graph.edges(keys=True, data=True):
         scores = score_map.get(str(data["segment_id"]), {})
@@ -1036,6 +1512,9 @@ def apply_scores_to_graph(
         data["cmcs"] = float(scores.get("cmcs_final", data["cmcs_ahp"]))
         data["ml_risk_probability"] = float(
             scores.get("ml_risk_probability", 0.5)
+        )
+        data["regional_risk_probability"] = float(
+            scores.get("regional_risk_probability", 0.5)
         )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1062,6 +1541,7 @@ def create_city_risk_map(
                 "cmcs",
                 "cmcs_final",
                 "ml_risk_probability",
+                "regional_risk_probability",
             ]
         ].copy(),
         geometry=geometry,
@@ -1070,6 +1550,9 @@ def create_city_risk_map(
     risk_gdf["cmcs_final"] = risk_gdf["cmcs_final"].round(4)
     risk_gdf["ml_risk_probability"] = risk_gdf[
         "ml_risk_probability"
+    ].round(4)
+    risk_gdf["regional_risk_probability"] = risk_gdf[
+        "regional_risk_probability"
     ].round(4)
     map_object = folium.Map(
         location=[36.3504, 127.3845],
@@ -1098,8 +1581,15 @@ def create_city_risk_map(
                 "highway",
                 "cmcs_final",
                 "ml_risk_probability",
+                "regional_risk_probability",
             ],
-            aliases=["자치구", "도로 유형", "최종 CMCS", "ML 위험 확률"],
+            aliases=[
+                "자치구",
+                "도로 유형",
+                "최종 CMCS",
+                "도로 ML 위험 확률",
+                "권역 XGBoost 위험 확률",
+            ],
         ),
         name="상위 위험 도로",
     ).add_to(map_object)
@@ -1379,6 +1869,7 @@ def run_actual_route_recommendation(
             "length_m",
             "cmcs_final",
             "ml_risk_probability",
+            "regional_risk_probability",
         ]
     ].sort_values("cmcs_final", ascending=False)
     avoided_path = REPORT_OUTPUT_DIR / "actual_route_avoided_segments.csv"
@@ -1416,12 +1907,32 @@ def run_full_pipeline(
     collected = collect_available_real_data(refresh=refresh_data)
     graph = build_or_load_walk_graph(refresh=refresh_network)
     edge_features, graph = build_edge_feature_table(graph, data_dir=data_dir)
-    segment_scores, model_report = train_edge_risk_model(edge_features)
+    segment_scores, edge_model_report = train_edge_risk_model(edge_features)
+    segment_scores, regional_model_report = train_regional_boosting_model(
+        segment_scores
+    )
     score_columns = segment_scores[
-        ["segment_id", "cmcs", "cmcs_final", "ml_risk_probability"]
+        [
+            "segment_id",
+            "cmcs",
+            "cmcs_final",
+            "ml_risk_probability",
+            "regional_risk_probability",
+            "regional_risk_prediction",
+            "region_x",
+            "region_y",
+        ]
     ]
     final_edges = edge_features.drop(
-        columns=["cmcs_final", "ml_risk_probability"], errors="ignore"
+        columns=[
+            "cmcs_final",
+            "ml_risk_probability",
+            "regional_risk_probability",
+            "regional_risk_prediction",
+            "region_x",
+            "region_y",
+        ],
+        errors="ignore",
     ).merge(score_columns, on=["segment_id", "cmcs"], how="left")
     final_edges.to_csv(EDGE_CMCS_PATH, index=False, encoding="utf-8-sig")
     graph = apply_scores_to_graph(graph, segment_scores)
@@ -1448,7 +1959,12 @@ def run_full_pipeline(
                 (final_edges["cmcs_final"] >= 0.6).sum()
             ),
         },
-        "model": model_report,
+        "model": edge_model_report,
+        "edge_model": edge_model_report,
+        "regional_boosting_model": regional_model_report,
+        "f1_target_achieved": regional_model_report[
+            "f1_target_achieved"
+        ],
         "route": {
             "origin": route_result["endpoints"]["origin_name"],
             "destination": route_result["endpoints"]["destination_name"],
@@ -1485,6 +2001,8 @@ def run_full_pipeline(
             "edge_cmcs": str(EDGE_CMCS_PATH),
             "scored_graph": str(SCORED_GRAPH_PATH),
             "edge_model": str(EDGE_MODEL_PATH),
+            "regional_model": str(REGIONAL_MODEL_PATH),
+            "regional_model_report": str(REGIONAL_MODEL_REPORT_PATH),
             "route_map": str(route_result["map_path"]),
             "route_comparison": str(route_result["comparison_path"]),
             "city_risk_map": str(risk_map_path),
