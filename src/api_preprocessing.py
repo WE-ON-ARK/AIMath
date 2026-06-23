@@ -313,6 +313,92 @@ def update_api_preprocessing_report(
     return path
 
 
+def preprocess_for_cmcs_analysis(
+    edge_features: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """CMCS 통계 분석에 투입할 edge feature를 정규화·이상치 처리한다.
+
+    단계:
+      1. 수치 컬럼 강제 변환 및 결측 대체 (중앙값)
+      2. 비음수 컬럼 winsorization (0.5%–99.5%)
+      3. 0–1 범위 클리핑 (이미 정규화된 _norm 컬럼)
+      4. IQR 기반 이상치 플래깅 (제거하지 않고 마킹)
+      5. 전처리 통계 리포트 생성
+    """
+    result = edge_features.copy()
+    report: dict[str, object] = {"input_rows": len(result)}
+
+    norm_columns = [
+        col for col in result.columns
+        if col.endswith("_norm") or col.startswith("has_") or col.startswith("is_")
+    ]
+    count_columns = [
+        col for col in result.columns
+        if col.endswith("_count") and not col.endswith("_norm")
+    ]
+    numeric_columns = norm_columns + count_columns + ["length_m", "accident_count"]
+    numeric_columns = [col for col in numeric_columns if col in result.columns]
+
+    coercion_failures: dict[str, int] = {}
+    for col in numeric_columns:
+        original_valid = result[col].notna().sum()
+        result[col] = pd.to_numeric(result[col], errors="coerce")
+        coercion_failures[col] = int(original_valid - result[col].notna().sum())
+    report["coercion_failures"] = {
+        k: v for k, v in coercion_failures.items() if v > 0
+    }
+
+    median_fill: dict[str, float] = {}
+    for col in numeric_columns:
+        missing = int(result[col].isna().sum())
+        if missing > 0:
+            fill_value = float(result[col].median()) if result[col].notna().any() else 0.0
+            result[col] = result[col].fillna(fill_value)
+            median_fill[col] = round(fill_value, 6)
+    report["median_imputation"] = median_fill
+
+    winsorization_applied: dict[str, dict[str, float]] = {}
+    for col in count_columns:
+        if col not in result.columns:
+            continue
+        series = result[col]
+        if series.nunique(dropna=True) < 3:
+            continue
+        clipped, bounds = _winsorize_nonnegative(series)
+        if bounds:
+            result[col] = clipped
+            winsorization_applied[col] = bounds
+    report["winsorization"] = winsorization_applied
+
+    clipped_columns: list[str] = []
+    for col in norm_columns:
+        if col in result.columns:
+            before_min = float(result[col].min())
+            before_max = float(result[col].max())
+            result[col] = result[col].clip(lower=0.0, upper=1.0)
+            if before_min < -0.001 or before_max > 1.001:
+                clipped_columns.append(col)
+    report["range_clipped_columns"] = clipped_columns
+
+    outlier_flags: dict[str, int] = {}
+    for col in count_columns:
+        if col not in result.columns:
+            continue
+        q1 = result[col].quantile(0.25)
+        q3 = result[col].quantile(0.75)
+        iqr = q3 - q1
+        if iqr <= 0:
+            continue
+        upper_fence = q3 + 3.0 * iqr
+        n_outliers = int((result[col] > upper_fence).sum())
+        if n_outliers > 0:
+            outlier_flags[col] = n_outliers
+            result[f"_outlier_{col}"] = (result[col] > upper_fence).astype(int)
+    report["iqr_outlier_flags"] = outlier_flags
+    report["output_rows"] = len(result)
+    return result, report
+
+
 def preprocess_existing_api_files(
     raw_dir: str | Path = "data/raw",
 ) -> dict[str, dict[str, object]]:
