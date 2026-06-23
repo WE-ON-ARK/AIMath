@@ -22,7 +22,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev,viz]"
 python main.py demo
-pytest  # 테스트 75개 실행
+pytest  # 테스트 78개 실행
 ```
 
 데모 산출물은 다음 위치에 생성됩니다.
@@ -81,14 +81,19 @@ python main.py full-pipeline
 7. LogisticRegression 기준선과 RandomForest·XGBoost를 동일 Fold로 비교
 8. OOF Average Precision 우선, ROC-AUC 차순으로 RF/XGBoost 최종 모델 선정
 9. OOF F1 최적 임계값과 고정 0.5 임계값 성능을 함께 저장
-10. 자치구 경계로 분리한 1.5km 통학 권역 XGBoost를 구별 홀드아웃으로 검증
-11. 권역 OOF F1 0.5 이상일 때 권역 위험 확률을 도로 CMCS에 혼합
-12. 대전문정초등학교에서 실제 둔산 지역 학원까지 최단·안전·균형 경로 산출
-13. 경로 비교 CSV, 파레토 데이터, HTML 지도, 모델·종합 리포트 저장
+10. 1.75km 권역별 도로 극값·분산·시설 밀도·도로 구성비 전처리
+11. 7개 시드 XGBoost 앙상블과 중첩 자치구 홀드아웃으로 안정성 검증
+12. 중첩 검증 F1과 모든 시드 F1이 0.5 이상일 때 권역 위험을 CMCS에 혼합
+13. 대전문정초등학교에서 실제 둔산 지역 학원까지 최단·안전·균형 경로 산출
+14. 20개 이상 학교 OD에서 위험감소 비율과 우회율 안정성 검증
+15. 경로 비교 CSV, 파레토 데이터, HTML 지도, 모델·종합 리포트 저장
 
 F1 0.5 목표는 희소한 사고 다발지역 라벨을 그대로 복제하거나 음성 표본을
-임의 축소하지 않고, 1.5km 통학 위험 권역 분류 문제로 계층화해 평가합니다.
-보고서에는 도로 단위 모델과 권역 단위 XGBoost 지표를 분리해 저장합니다.
+임의 축소하지 않고, 1.75km 통학 위험 권역 분류 문제로 계층화해 평가합니다.
+사고 건수와 사고에서 파생된 CMCS 값은 입력 피처에서 제외하며, 외부 자치구의
+임계값까지 학습 구역 내부에서만 정하는 중첩 검증 결과를 최종 F1로 사용합니다.
+정답 통학 경로 라벨은 없으므로 경로 선정 자체에 F1을 부여하지 않고 다수 OD의
+위험노출 감소·우회율로 별도 검증합니다.
 
 주요 결과:
 
@@ -108,6 +113,7 @@ outputs/reports/edge_model_leaderboard.csv
 outputs/reports/edge_model_validation_predictions.csv
 outputs/reports/regional_boosting_report.json
 outputs/reports/regional_boosting_predictions.csv
+outputs/reports/route_stability_evaluation.json
 outputs/reports/full_pipeline_report.json
 outputs/charts/edge_model_roc_pr.png
 outputs/charts/edge_model_explainability.png
@@ -227,7 +233,7 @@ api/
   main.py                 # FastAPI 앱 및 라우터
 static/
   index.html              # Leaflet.js 기반 웹 UI
-tests/                    # 테스트 75개
+tests/                    # 테스트 78개
 main.py
 config.py
 ```

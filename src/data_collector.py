@@ -3,11 +3,16 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import networkx as nx
 import pandas as pd
 import requests
+
+from src.api_preprocessing import (
+    preprocess_api_frame,
+    update_api_preprocessing_report,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,11 @@ DEFAULT_ENDPOINTS: dict[str, APIEndpoint] = {
     "traffic_accident": APIEndpoint(
         path="/B552061/AccidentDeath/getRestTrafficAccident",
         params={"type": "json", "searchYear": 2023, "siDo": "대전"},
+    ),
+    "schoolzone_child_hotspot": APIEndpoint(
+        path="/B552061/schoolzoneChild/getRestSchoolzoneChild",
+        params={"type": "json", "siDo": "30", "guGun": ""},
+        page_size=100,
     ),
 }
 
@@ -122,8 +132,12 @@ class DataCollector:
             page += 1
             time.sleep(self.request_interval_seconds)
 
-        result = pd.DataFrame(records)
+        result, preprocessing_report = preprocess_api_frame(
+            pd.DataFrame(records),
+            name,
+        )
         result.to_csv(self.raw_dir / f"{name}.csv", index=False, encoding="utf-8-sig")
+        update_api_preprocessing_report(preprocessing_report)
         return result
 
     def fetch_school_zone(self) -> pd.DataFrame:
@@ -135,6 +149,51 @@ class DataCollector:
             DEFAULT_ENDPOINTS["traffic_accident"],
             {"searchYear": year},
         )
+
+    def fetch_schoolzone_child_hotspots(
+        self,
+        years: Iterable[int] = range(2012, 2025),
+        output_path: str | Path | None = None,
+    ) -> pd.DataFrame:
+        endpoint = DEFAULT_ENDPOINTS["schoolzone_child_hotspot"]
+        records: list[dict[str, Any]] = []
+        for year in years:
+            page = 1
+            while True:
+                params = {
+                    **endpoint.params,
+                    "serviceKey": self.api_key,
+                    "searchYearCd": int(year),
+                    endpoint.page_parameter: page,
+                    endpoint.page_size_parameter: endpoint.page_size,
+                }
+                response = self.session.get(
+                    f"{self.base_url}{endpoint.path}",
+                    params=params,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                body = self._extract_body(payload)
+                items = self._extract_items(body)
+                for item in items:
+                    item["search_year"] = int(year)
+                records.extend(items)
+                total_count = int(body.get("totalCount", len(records)) or 0)
+                if not items or page * endpoint.page_size >= total_count:
+                    break
+                page += 1
+                time.sleep(self.request_interval_seconds)
+        clean, report = preprocess_api_frame(
+            pd.DataFrame(records),
+            "traffic_accident",
+        )
+        path = Path(output_path) if output_path else (
+            self.raw_dir / "daejeon_schoolzone_accident_hotspots.csv"
+        )
+        clean.to_csv(path, index=False, encoding="utf-8-sig")
+        update_api_preprocessing_report(report)
+        return clean
 
     def fetch_all(
         self, endpoints: Mapping[str, APIEndpoint] | None = None
@@ -164,4 +223,3 @@ def build_pedestrian_network(
     path.parent.mkdir(parents=True, exist_ok=True)
     ox.save_graphml(graph, filepath=path)
     return graph
-

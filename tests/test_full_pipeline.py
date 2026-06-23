@@ -3,6 +3,7 @@ import pandas as pd
 
 from src.full_pipeline import (
     EDGE_MODEL_FEATURES,
+    REGIONAL_MODEL_FEATURES,
     _aggregate_regional_features,
     _build_edge_model_candidates,
     _edge_metrics,
@@ -88,3 +89,11 @@ def test_regional_cells_do_not_cross_district_boundaries():
 
     assert len(regions) == 2
     assert set(regions["district"]) == {"서구", "유성구"}
+
+
+def test_regional_model_features_exclude_accident_derived_values():
+    forbidden_prefixes = ("accident", "casualty", "death", "cmcs")
+    assert not any(
+        feature.startswith(forbidden_prefixes)
+        for feature in REGIONAL_MODEL_FEATURES
+    )

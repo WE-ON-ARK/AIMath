@@ -49,7 +49,8 @@ def _read_json(path: Path) -> dict[str, object]:
 def _bootstrap_intervals(
     target: np.ndarray,
     probability: np.ndarray,
-    threshold: float,
+    threshold: float | None = None,
+    prediction: np.ndarray | None = None,
     iterations: int = 3000,
     random_state: int = 42,
 ) -> dict[str, list[float]]:
@@ -61,14 +62,24 @@ def _bootstrap_intervals(
         if np.unique(sampled_target).size < 2:
             continue
         sampled_probability = probability[indices]
-        prediction = sampled_probability >= threshold
+        sampled_prediction = (
+            prediction[indices]
+            if prediction is not None
+            else sampled_probability >= float(threshold)
+        )
         values.append(
             [
                 roc_auc_score(sampled_target, sampled_probability),
                 average_precision_score(sampled_target, sampled_probability),
-                f1_score(sampled_target, prediction, zero_division=0),
-                precision_score(sampled_target, prediction, zero_division=0),
-                recall_score(sampled_target, prediction, zero_division=0),
+                f1_score(
+                    sampled_target, sampled_prediction, zero_division=0
+                ),
+                precision_score(
+                    sampled_target, sampled_prediction, zero_division=0
+                ),
+                recall_score(
+                    sampled_target, sampled_prediction, zero_division=0
+                ),
             ]
         )
     array = np.asarray(values)
@@ -106,9 +117,27 @@ def _regional_metrics(
     predictions: pd.DataFrame,
 ) -> tuple[dict[str, float | int], pd.DataFrame, dict[str, list[float]]]:
     target = predictions["accident_label"].astype(int).to_numpy()
-    probability = predictions["oof_risk_probability"].astype(float).to_numpy()
-    threshold = _optimal_f1_threshold(target, probability)
-    prediction = probability >= threshold
+    nested_columns = {
+        "nested_oof_probability",
+        "nested_oof_prediction",
+        "nested_decision_threshold",
+    }
+    if nested_columns.issubset(predictions.columns):
+        probability = predictions["nested_oof_probability"].astype(
+            float
+        ).to_numpy()
+        prediction = predictions["nested_oof_prediction"].astype(int).to_numpy()
+        threshold = float(
+            predictions["nested_decision_threshold"].astype(float).mean()
+        )
+        validation_method = "중첩 자치구 홀드아웃"
+    else:
+        probability = predictions["oof_risk_probability"].astype(
+            float
+        ).to_numpy()
+        threshold = _optimal_f1_threshold(target, probability)
+        prediction = probability >= threshold
+        validation_method = "자치구 홀드아웃"
     tn = int(((prediction == 0) & (target == 0)).sum())
     fp = int(((prediction == 1) & (target == 0)).sum())
     fn = int(((prediction == 0) & (target == 1)).sum())
@@ -123,6 +152,7 @@ def _regional_metrics(
         "positive_regions": int(target.sum()),
         "prevalence": prevalence,
         "threshold": float(threshold),
+        "validation_method": validation_method,
         "roc_auc": float(roc_auc_score(target, probability)),
         "average_precision": float(
             average_precision_score(target, probability)
@@ -156,10 +186,17 @@ def _regional_metrics(
     district_rows: list[dict[str, object]] = []
     for district, group in predictions.groupby("district"):
         district_target = group["accident_label"].astype(int).to_numpy()
-        district_probability = group["oof_risk_probability"].astype(
-            float
-        ).to_numpy()
-        district_prediction = district_probability >= threshold
+        probability_column = (
+            "nested_oof_probability"
+            if "nested_oof_probability" in group
+            else "oof_risk_probability"
+        )
+        district_probability = group[probability_column].astype(float).to_numpy()
+        district_prediction = (
+            group["nested_oof_prediction"].astype(int).to_numpy()
+            if "nested_oof_prediction" in group
+            else district_probability >= threshold
+        )
         row: dict[str, object] = {
             "자치구": district,
             "권역 수": len(group),
@@ -183,7 +220,11 @@ def _regional_metrics(
             )
         district_rows.append(row)
     district_metrics = pd.DataFrame(district_rows)
-    intervals = _bootstrap_intervals(target, probability, threshold)
+    intervals = _bootstrap_intervals(
+        target,
+        probability,
+        prediction=prediction,
+    )
     return metrics, district_metrics, intervals
 
 
@@ -213,15 +254,15 @@ def _performance_table(
         )
     rows.append(
         {
-            "평가 단위": "1.5km 권역",
-            "모델": "XGBoost",
+            "평가 단위": "1.75km 권역",
+            "모델": "XGBoost 앙상블",
             "ROC-AUC": regional["roc_auc"],
             "AP": regional["average_precision"],
             "F1": regional["f1"],
             "정밀도": regional["precision"],
             "재현율": regional["recall"],
             "Brier": regional["brier_score"],
-            "검증": "자치구 Leave-One-Group-Out",
+            "검증": "중첩 자치구 Leave-One-Group-Out",
             "판정": "조건부",
         }
     )
@@ -234,11 +275,14 @@ def _safety_matrix(
     regional: dict[str, float | int],
     district_metrics: pd.DataFrame,
     route_report: dict[str, object],
+    regional_report: dict[str, object],
     temporal_report: dict[str, object],
     quality_report: dict[str, object],
 ) -> pd.DataFrame:
     min_district_f1 = float(district_metrics["F1"].min())
     route = route_report["route"]
+    route_stability = route.get("stability_validation", {})
+    model_stability = regional_report.get("stability", {})
     all_coordinate_pass_rates = [
         dataset["pass_rate"]
         for dataset in quality_report["coordinate_quality"].values()
@@ -261,8 +305,23 @@ def _safety_matrix(
                 f"양성 {regional['positive_regions']}개 중 "
                 f"{regional['false_negative']}개 누락"
             ),
-            "상태": "미흡",
-            "운영 의미": "모델이 낮게 평가한 경로도 안전하다고 단정 금지",
+            "상태": "조건부" if regional["recall"] >= 0.65 else "미흡",
+            "운영 의미": "개선됐지만 모델이 낮게 평가한 경로도 안전 단정 금지",
+        },
+        {
+            "평가 영역": "부스팅 재현 안정성",
+            "근거": (
+                f"7개 시드 최소 F1 "
+                f"{model_stability.get('minimum_seed_f1', 0):.3f}, "
+                f"표준편차 "
+                f"{model_stability.get('seed_f1_standard_deviation', 0):.3f}"
+            ),
+            "상태": (
+                "양호"
+                if model_stability.get("minimum_seed_f1", 0) >= 0.5
+                else "미흡"
+            ),
+            "운영 의미": "랜덤 시드 변화에도 전체 F1 0.5 이상 유지",
         },
         {
             "평가 영역": "확률 보정",
@@ -315,11 +374,18 @@ def _safety_matrix(
         {
             "평가 영역": "경로 효용",
             "근거": (
-                f"실제 1개 OD에서 위험노출 {route['risk_reduction_pct']:.1f}% "
-                f"감소, 거리 {(route['safest_distance_m'] / route['shortest_distance_m'] - 1) * 100:.1f}% 증가"
+                f"{route_stability.get('evaluated_pairs', 1)}개 OD에서 "
+                f"위험감소 비율 "
+                f"{route_stability.get('positive_risk_reduction_ratio', 0) * 100:.1f}%, "
+                f"중앙 위험감소 "
+                f"{route_stability.get('median_risk_reduction_pct', route['risk_reduction_pct']):.1f}%"
             ),
-            "상태": "조건부",
-            "운영 의미": "효용 신호는 있으나 다수 OD·현장 보행 검증 필요",
+            "상태": (
+                "양호"
+                if route_stability.get("route_selection_stability_passed")
+                else "조건부"
+            ),
+            "운영 의미": "다수 OD 수치 검증 통과, 현장 보행 검증은 별도 필요",
         },
         {
             "평가 영역": "설명 가능성",
@@ -379,6 +445,7 @@ def _markdown_report(
     route_report: dict[str, object],
 ) -> str:
     route = route_report["route"]
+    route_stability = route.get("stability_validation", {})
     return f"""# CMCS 모델 안전성 및 적용 가능성 종합 평가
 
 - 평가일: {date.today().isoformat()}
@@ -411,7 +478,10 @@ F1 {intervals['f1'][0]:.3f}–{intervals['f1'][1]:.3f}.
 - 최단거리: {route['shortest_distance_m']:.0f}m
 - 안전 경로: {route['safest_distance_m']:.0f}m
 - 위험노출 감소: {route['risk_reduction_pct']:.1f}%
-- 주의: 단일 OD 사례이므로 일반화된 안전 개선 효과로 해석할 수 없습니다.
+- 다중 OD 검증: {route_stability.get('evaluated_pairs', 0)}개 경로 중
+  {route_stability.get('positive_risk_reduction_ratio', 0) * 100:.1f}%에서
+  위험노출 감소, 중앙값 {route_stability.get('median_risk_reduction_pct', 0):.1f}%
+- 주의: 정답 통학 경로 라벨은 없어 경로 선정 자체의 F1은 계산할 수 없습니다.
 
 ## 최종 적용 범위
 
@@ -454,6 +524,7 @@ def _html_report(
     route_report: dict[str, object],
 ) -> str:
     route = route_report["route"]
+    route_stability = route.get("stability_validation", {})
     recommendations = "".join(
         f"<li>{html.escape(item)}</li>" for item in _recommendations()
     )
@@ -488,7 +559,7 @@ th{{background:#0f172a;color:white;position:sticky;top:0}}
 <div class="card"><div class="label">권역 ROC-AUC</div><div class="value">{regional['roc_auc']:.3f}</div></div>
 <div class="card"><div class="label">권역 F1</div><div class="value">{regional['f1']:.3f}</div></div>
 <div class="card"><div class="label">권역 재현율</div><div class="value">{regional['recall']:.3f}</div></div>
-<div class="card"><div class="label">실제 경로 위험노출 감소</div><div class="value">{route['risk_reduction_pct']:.1f}%</div></div>
+<div class="card"><div class="label">다중 OD 위험감소 경로 비율</div><div class="value">{route_stability.get('positive_risk_reduction_ratio', 0) * 100:.1f}%</div></div>
 </div>
 <h2>성능 지표 비교</h2>
 {_html_table(performance, "판정")}
@@ -523,12 +594,12 @@ def _draw_dashboard(
 
     plt.rcParams["font.family"] = "NanumGothic"
     plt.rcParams["axes.unicode_minus"] = False
-    figure = plt.figure(figsize=(18, 14), facecolor="#F8FAFC")
+    figure = plt.figure(figsize=(18, 16.5), facecolor="#F8FAFC")
     grid = figure.add_gridspec(
         4,
         2,
-        height_ratios=[0.55, 1.2, 1.55, 1.1],
-        hspace=0.35,
+        height_ratios=[0.55, 1.2, 2.05, 1.2],
+        hspace=0.42,
         wspace=0.16,
     )
 
@@ -657,7 +728,7 @@ def _draw_dashboard(
     )
     safety_table.auto_set_font_size(False)
     safety_table.set_fontsize(9.5)
-    safety_table.scale(1, 1.78)
+    safety_table.scale(1, 1.72)
     for (row, column), cell in safety_table.get_celld().items():
         cell.set_edgecolor("#CBD5E1")
         if row == 0:
@@ -676,7 +747,7 @@ def _draw_dashboard(
         loc="left",
         fontsize=16,
         fontweight="bold",
-        pad=14,
+        pad=20,
     )
 
     district_axis = figure.add_subplot(grid[3, 0])
@@ -711,15 +782,17 @@ def _draw_dashboard(
     route_axis = figure.add_subplot(grid[3, 1])
     route_axis.axis("off")
     route = route_report["route"]
+    route_stability = route.get("stability_validation", {})
     route_axis.text(
         0.02,
         0.72,
         (
             "실제 경로 효용\n"
-            f"위험노출 감소  {route['risk_reduction_pct']:.1f}%\n"
-            f"거리 증가       "
-            f"{(route['safest_distance_m'] / route['shortest_distance_m'] - 1) * 100:.1f}%\n"
-            f"회피 구간       {route['avoided_segment_count']}개"
+            f"검증 OD        {route_stability.get('evaluated_pairs', 0)}개\n"
+            f"위험감소 경로  "
+            f"{route_stability.get('positive_risk_reduction_ratio', 0) * 100:.1f}%\n"
+            f"중앙 위험감소  "
+            f"{route_stability.get('median_risk_reduction_pct', 0):.1f}%"
         ),
         fontsize=14,
         linespacing=1.5,
@@ -754,6 +827,9 @@ def generate_final_model_evaluation() -> dict[str, object]:
     REPORT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     CHART_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     edge_report = _read_json(REPORT_OUTPUT_DIR / "edge_model_report.json")
+    regional_report = _read_json(
+        REPORT_OUTPUT_DIR / "regional_boosting_report.json"
+    )
     route_report = _read_json(REPORT_OUTPUT_DIR / "full_pipeline_report.json")
     temporal_report = _read_json(REPORT_OUTPUT_DIR / "temporal_split_report.json")
     quality_report = _read_json(REPORT_OUTPUT_DIR / "data_quality_report.json")
@@ -766,6 +842,7 @@ def generate_final_model_evaluation() -> dict[str, object]:
         regional,
         district,
         route_report,
+        regional_report,
         temporal_report,
         quality_report,
     )

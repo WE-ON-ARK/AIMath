@@ -53,13 +53,26 @@ from config import (
     SETTINGS,
     ensure_directories,
 )
+from src.api_preprocessing import (
+    preprocess_api_frame,
+    preprocess_existing_api_files,
+    update_api_preprocessing_report,
+)
 from src.cmcs_calculator import CMCSCalculator
+from src.data_driven_cmcs import (
+    DATA_DRIVEN_CHART_PATH,
+    DATA_DRIVEN_REPORT_PATH,
+    DATA_DRIVEN_WEIGHTS_PATH,
+    derive_data_driven_cmcs_weights,
+)
 from src.real_data_pipeline import (
     DISTRICTS,
     extract_district,
+    haversine_matrix,
     read_csv_flexible,
 )
 from src.route_optimizer import RouteOptimizer
+from src.route_validator import batch_od_evaluation
 
 
 PROJECTED_CRS = "EPSG:5179"
@@ -72,7 +85,9 @@ EDGE_MODEL_REPORT_PATH = REPORT_OUTPUT_DIR / "edge_model_report.json"
 REGIONAL_MODEL_PATH = MODEL_DIR / "regional_xgboost_risk_model.pkl"
 REGIONAL_MODEL_REPORT_PATH = REPORT_OUTPUT_DIR / "regional_boosting_report.json"
 FULL_PIPELINE_REPORT_PATH = REPORT_OUTPUT_DIR / "full_pipeline_report.json"
-REGIONAL_CELL_SIZE_M = 1500
+REGIONAL_CELL_SIZE_M = 1750
+REGIONAL_ENSEMBLE_SEEDS = (7, 17, 29, 42, 61, 91, 113)
+REGIONAL_NESTED_SEEDS = (17, 42, 91)
 
 EDGE_MODEL_FEATURES = [
     "traffic_volume_norm",
@@ -94,12 +109,6 @@ EDGE_MODEL_FEATURES = [
     "crosswalk_count_norm",
     "signal_count_norm",
     "speed_bump_count_norm",
-]
-
-REGIONAL_MODEL_FEATURES = EDGE_MODEL_FEATURES + [
-    "center_x",
-    "center_y",
-    "segment_count",
 ]
 
 DISTRICT_QUERIES = {
@@ -154,6 +163,64 @@ HIGHWAY_SPEED_PROXY = {
     "track": 10.0,
 }
 
+REGIONAL_DISTRIBUTION_FEATURES = [
+    "traffic_volume_norm",
+    "avg_speed_norm",
+    "narrow_sidewalk_norm",
+    "slope_norm",
+    "pedestrian_flow_norm",
+    "bus_stop_nearby_norm",
+    "illegal_parking_norm",
+    "lane_count_norm",
+]
+
+REGIONAL_SUM_FEATURES = [
+    "length_m",
+    "crosswalk_count",
+    "signal_count",
+    "speed_bump_count",
+    "bus_stop_count",
+    "streetlight_count",
+    "school_zone_cctv_count",
+    "is_school_zone",
+    "has_crosswalk",
+    "has_signal",
+    "has_speed_bump",
+    "has_cctv",
+]
+
+REGIONAL_HIGHWAY_CLASSES = tuple(HIGHWAY_TRAFFIC_PROXY) + ("other",)
+REGIONAL_DERIVED_FEATURES = [
+    "log_segment_count",
+    "road_length_km",
+    "crosswalk_per_km",
+    "signal_per_km",
+    "speed_bump_per_km",
+    "bus_stop_per_km",
+    "streetlight_per_km",
+    "school_zone_cctv_per_km",
+    "school_zone_share",
+    "crosswalk_coverage",
+    "signal_coverage",
+    "speed_bump_coverage",
+    "cctv_coverage",
+    "structural_hazard_mean",
+    "structural_hazard_peak",
+]
+
+REGIONAL_MODEL_FEATURES = (
+    EDGE_MODEL_FEATURES
+    + ["center_x", "center_y", "segment_count"]
+    + [
+        f"{feature}_{statistic}"
+        for statistic in ("max", "std", "q90")
+        for feature in REGIONAL_DISTRIBUTION_FEATURES
+    ]
+    + [f"{feature}_sum" for feature in REGIONAL_SUM_FEATURES]
+    + [f"hw_share_{highway}" for highway in REGIONAL_HIGHWAY_CLASSES]
+    + REGIONAL_DERIVED_FEATURES
+)
+
 
 def _api_key_from_environment_or_pdf(pdf_path: Path) -> str:
     if SETTINGS.api_key:
@@ -198,10 +265,14 @@ def collect_speed_bumps(
     )
     if isinstance(items, dict):
         items = [items]
-    frame = pd.DataFrame(items)
+    frame, preprocessing_report = preprocess_api_frame(
+        pd.DataFrame(items),
+        "speed_bump",
+    )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False, encoding="utf-8-sig")
+    update_api_preprocessing_report(preprocessing_report)
     return frame
 
 
@@ -239,10 +310,14 @@ def collect_school_zones(
         if not page_items or len(rows) >= total_count:
             break
         page += 1
-    frame = pd.DataFrame(rows)
+    frame, preprocessing_report = preprocess_api_frame(
+        pd.DataFrame(rows),
+        "school_zone",
+    )
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False, encoding="utf-8-sig")
+    update_api_preprocessing_report(preprocessing_report)
     return frame
 
 
@@ -293,6 +368,8 @@ def collect_osm_point_features(
 
 def collect_available_real_data(refresh: bool = False) -> dict[str, int]:
     ensure_directories()
+    if not refresh:
+        preprocess_existing_api_files(RAW_DATA_DIR)
     counts: dict[str, int] = {}
     speed_path = RAW_DATA_DIR / "speed_bump.csv"
     zone_path = RAW_DATA_DIR / "school_zone.csv"
@@ -473,9 +550,14 @@ def _load_point_datasets(data_dir: Path) -> dict[str, gpd.GeoDataFrame]:
     signal = read_csv_flexible(next(data_dir.glob("*신호등*.csv")))
     speed_bump = read_csv_flexible(RAW_DATA_DIR / "speed_bump.csv")
     school_zone = read_csv_flexible(RAW_DATA_DIR / "school_zone.csv")
-    accident = read_csv_flexible(
+    accident_raw = read_csv_flexible(
         RAW_DATA_DIR / "daejeon_schoolzone_accident_hotspots.csv"
     )
+    accident, accident_preprocessing_report = preprocess_api_frame(
+        accident_raw,
+        "traffic_accident",
+    )
+    update_api_preprocessing_report(accident_preprocessing_report)
 
     def points(
         frame: pd.DataFrame, lon_column: str, lat_column: str
@@ -726,7 +808,18 @@ def build_edge_feature_table(
         + 0.20 * segments["is_school_zone"]
     ).clip(0, 1)
 
-    scored = CMCSCalculator().score(segments.drop(columns="geometry"))
+    score_features = segments.drop(columns="geometry")
+    manual_calculator = CMCSCalculator()
+    learned_weights, weight_report = derive_data_driven_cmcs_weights(
+        score_features
+    )
+    scored = CMCSCalculator(learned_weights).score(score_features)
+    scored["cmcs_manual_legacy"] = manual_calculator.calculate_cmcs(
+        score_features
+    )
+    scored["cmcs_weight_evidence_methods"] = len(
+        weight_report["normalized_method_shares"]
+    )
     geometry_lookup = segments.set_index("segment_id")["geometry"]
     scored["geometry_wkt"] = scored["segment_id"].map(
         geometry_lookup.map(lambda geometry: geometry.wkt)
@@ -1126,18 +1219,52 @@ def _aggregate_regional_features(
     segment_scores: pd.DataFrame,
     cell_size_m: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    segments = segment_scores.copy()
+    segments = segment_scores.drop_duplicates("segment_id").copy()
+    segments = segments.drop(
+        columns=[
+            "region_x",
+            "region_y",
+            "regional_risk_probability",
+            "regional_risk_prediction",
+            "oof_risk_probability",
+            "oof_probability_std",
+            "nested_oof_probability",
+            "nested_oof_prediction",
+            "nested_decision_threshold",
+        ],
+        errors="ignore",
+    )
     segments["district"] = segments["district"].fillna("미분류").astype(str)
+    segments["highway"] = segments.get(
+        "highway", pd.Series("other", index=segments.index)
+    ).fillna("other").astype(str)
+    segments["highway_group"] = segments["highway"].where(
+        segments["highway"].isin(REGIONAL_HIGHWAY_CLASSES[:-1]),
+        "other",
+    )
+    for feature in set(
+        EDGE_MODEL_FEATURES
+        + REGIONAL_DISTRIBUTION_FEATURES
+        + REGIONAL_SUM_FEATURES
+    ):
+        if feature not in segments:
+            segments[feature] = 1.0 if feature == "length_m" else 0.0
+        segments[feature] = pd.to_numeric(
+            segments[feature], errors="coerce"
+        ).fillna(0.0)
     segments["region_x"] = (
-        pd.to_numeric(segments["center_x"], errors="coerce") // cell_size_m
+        pd.to_numeric(segments["center_x"], errors="coerce").fillna(0)
+        // cell_size_m
     ).astype(int)
     segments["region_y"] = (
-        pd.to_numeric(segments["center_y"], errors="coerce") // cell_size_m
+        pd.to_numeric(segments["center_y"], errors="coerce").fillna(0)
+        // cell_size_m
     ).astype(int)
     segments["accident_label"] = (
         pd.to_numeric(segments["accident_count"], errors="coerce").fillna(0) > 0
     ).astype(int)
 
+    key_columns = ["district", "region_x", "region_y"]
     aggregations: dict[str, object] = {
         feature: "mean" for feature in EDGE_MODEL_FEATURES
     }
@@ -1151,13 +1278,265 @@ def _aggregate_regional_features(
     )
     regions = (
         segments.groupby(
-            ["district", "region_x", "region_y"],
+            key_columns,
             as_index=False,
         )
         .agg(aggregations)
         .rename(columns={"segment_id": "segment_count"})
     )
+
+    grouped = segments.groupby(key_columns)
+    for statistic in ("max", "std"):
+        values = getattr(
+            grouped[REGIONAL_DISTRIBUTION_FEATURES],
+            statistic,
+        )()
+        if statistic == "std":
+            values = values.fillna(0.0)
+        values = values.add_suffix(f"_{statistic}").reset_index()
+        regions = regions.merge(values, on=key_columns, how="left")
+    quantiles = (
+        grouped[REGIONAL_DISTRIBUTION_FEATURES]
+        .quantile(0.90)
+        .add_suffix("_q90")
+        .reset_index()
+    )
+    regions = regions.merge(quantiles, on=key_columns, how="left")
+    sums = (
+        grouped[REGIONAL_SUM_FEATURES]
+        .sum()
+        .add_suffix("_sum")
+        .reset_index()
+    )
+    regions = regions.merge(sums, on=key_columns, how="left")
+
+    highway_shares = pd.crosstab(
+        [segments[column] for column in key_columns],
+        segments["highway_group"],
+        normalize="index",
+    ).reset_index()
+    for highway in REGIONAL_HIGHWAY_CLASSES:
+        if highway not in highway_shares:
+            highway_shares[highway] = 0.0
+    highway_shares = highway_shares.rename(
+        columns={
+            highway: f"hw_share_{highway}"
+            for highway in REGIONAL_HIGHWAY_CLASSES
+        }
+    )
+    regions = regions.merge(
+        highway_shares[
+            key_columns
+            + [
+                f"hw_share_{highway}"
+                for highway in REGIONAL_HIGHWAY_CLASSES
+            ]
+        ],
+        on=key_columns,
+        how="left",
+    )
+
+    regions["log_segment_count"] = np.log1p(regions["segment_count"])
+    regions["road_length_km"] = regions["length_m_sum"] / 1000.0
+    road_length = regions["road_length_km"].clip(lower=0.05)
+    for source, output in (
+        ("crosswalk_count_sum", "crosswalk_per_km"),
+        ("signal_count_sum", "signal_per_km"),
+        ("speed_bump_count_sum", "speed_bump_per_km"),
+        ("bus_stop_count_sum", "bus_stop_per_km"),
+        ("streetlight_count_sum", "streetlight_per_km"),
+        ("school_zone_cctv_count_sum", "school_zone_cctv_per_km"),
+    ):
+        regions[output] = regions[source] / road_length
+    segment_count = regions["segment_count"].clip(lower=1)
+    for source, output in (
+        ("is_school_zone_sum", "school_zone_share"),
+        ("has_crosswalk_sum", "crosswalk_coverage"),
+        ("has_signal_sum", "signal_coverage"),
+        ("has_speed_bump_sum", "speed_bump_coverage"),
+        ("has_cctv_sum", "cctv_coverage"),
+    ):
+        regions[output] = regions[source] / segment_count
+
+    # 사고 라벨 또는 사고 건수에서 파생된 CMCS를 넣지 않는 비누수 구조 위험도다.
+    regions["structural_hazard_mean"] = (
+        0.18 * regions["traffic_volume_norm"]
+        + 0.12 * regions["avg_speed_norm"]
+        + 0.15 * regions["narrow_sidewalk_norm"]
+        + 0.08 * regions["slope_norm"]
+        + 0.12 * regions["pedestrian_flow_norm"]
+        + 0.08 * regions["illegal_parking_norm"]
+        + 0.10 * (1.0 - regions["light_density_norm"])
+        + 0.08 * (1.0 - regions["has_crosswalk"])
+        + 0.06 * (1.0 - regions["has_signal"])
+        + 0.03 * regions["lane_count_norm"]
+    )
+    regions["structural_hazard_peak"] = (
+        0.25 * regions["traffic_volume_norm_max"]
+        + 0.15 * regions["avg_speed_norm_max"]
+        + 0.20 * regions["narrow_sidewalk_norm_max"]
+        + 0.10 * regions["pedestrian_flow_norm_max"]
+        + 0.10 * regions["illegal_parking_norm_max"]
+        + 0.10 * (1.0 - regions["light_density_norm"])
+        + 0.10 * regions["lane_count_norm_max"]
+    )
+    regions[REGIONAL_MODEL_FEATURES] = regions[
+        REGIONAL_MODEL_FEATURES
+    ].replace([np.inf, -np.inf], np.nan)
     return segments, regions
+
+
+def _regional_xgb_pipeline(
+    positive_count: int,
+    negative_count: int,
+    random_state: int,
+) -> Pipeline:
+    from xgboost import XGBClassifier
+
+    return Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "model",
+                XGBClassifier(
+                    n_estimators=400,
+                    max_depth=2,
+                    learning_rate=0.035,
+                    min_child_weight=2,
+                    subsample=0.90,
+                    colsample_bytree=0.85,
+                    reg_alpha=0.10,
+                    reg_lambda=5.0,
+                    scale_pos_weight=negative_count / max(positive_count, 1),
+                    objective="binary:logistic",
+                    eval_metric="logloss",
+                    tree_method="hist",
+                    random_state=random_state,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+
+def _metrics_from_predictions(
+    target: pd.Series,
+    probability: np.ndarray,
+    prediction: np.ndarray,
+) -> dict[str, object]:
+    probability_metrics: dict[str, object]
+    if target.nunique() >= 2:
+        probability_metrics = {
+            "roc_auc": round(float(roc_auc_score(target, probability)), 6),
+            "average_precision": round(
+                float(average_precision_score(target, probability)), 6
+            ),
+        }
+    else:
+        probability_metrics = {
+            "roc_auc": None,
+            "average_precision": None,
+        }
+    return {
+        **probability_metrics,
+        "brier_score": round(
+            float(brier_score_loss(target, probability)), 6
+        ),
+        "balanced_accuracy": round(
+            float(balanced_accuracy_score(target, prediction)), 6
+        ),
+        "precision": round(
+            float(precision_score(target, prediction, zero_division=0)), 6
+        ),
+        "recall": round(
+            float(recall_score(target, prediction, zero_division=0)), 6
+        ),
+        "f1": round(
+            float(f1_score(target, prediction, zero_division=0)), 6
+        ),
+        "confusion_matrix": confusion_matrix(target, prediction).tolist(),
+    }
+
+
+def _nested_regional_validation(
+    features: pd.DataFrame,
+    target: pd.Series,
+    groups: pd.Series,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict[str, object]]]:
+    probability = np.zeros(len(target), dtype=float)
+    prediction = np.zeros(len(target), dtype=int)
+    row_threshold = np.zeros(len(target), dtype=float)
+    fold_reports: list[dict[str, object]] = []
+    outer_splitter = LeaveOneGroupOut()
+
+    for train_index, test_index in outer_splitter.split(
+        features, target, groups
+    ):
+        train_features = features.iloc[train_index]
+        train_target = target.iloc[train_index]
+        train_groups = groups.iloc[train_index]
+        positive_count = int(train_target.sum())
+        negative_count = int((train_target == 0).sum())
+
+        inner_probabilities = []
+        for seed in REGIONAL_NESTED_SEEDS:
+            inner_model = _regional_xgb_pipeline(
+                positive_count,
+                negative_count,
+                seed,
+            )
+            inner_probabilities.append(
+                cross_val_predict(
+                    inner_model,
+                    train_features,
+                    train_target,
+                    groups=train_groups,
+                    cv=LeaveOneGroupOut(),
+                    method="predict_proba",
+                    n_jobs=1,
+                )[:, 1]
+            )
+        inner_probability = np.mean(inner_probabilities, axis=0)
+        threshold = float(
+            np.clip(
+                _optimal_f1_threshold(train_target, inner_probability),
+                0.20,
+                0.70,
+            )
+        )
+
+        test_probabilities = []
+        for seed in REGIONAL_NESTED_SEEDS:
+            model = _regional_xgb_pipeline(
+                positive_count,
+                negative_count,
+                seed,
+            )
+            model.fit(train_features, train_target)
+            test_probabilities.append(
+                model.predict_proba(features.iloc[test_index])[:, 1]
+            )
+        fold_probability = np.mean(test_probabilities, axis=0)
+        fold_prediction = (fold_probability >= threshold).astype(int)
+        probability[test_index] = fold_probability
+        prediction[test_index] = fold_prediction
+        row_threshold[test_index] = threshold
+        held_out_district = str(groups.iloc[test_index[0]])
+        fold_metrics = _metrics_from_predictions(
+            target.iloc[test_index],
+            fold_probability,
+            fold_prediction,
+        )
+        fold_reports.append(
+            {
+                "held_out_district": held_out_district,
+                "test_count": int(len(test_index)),
+                "positive_count": int(target.iloc[test_index].sum()),
+                "threshold": round(threshold, 6),
+                **fold_metrics,
+            }
+        )
+    return probability, prediction, row_threshold, fold_reports
 
 
 def train_regional_boosting_model(
@@ -1186,49 +1565,80 @@ def train_regional_boosting_model(
 
     positive_count = int(y.sum())
     negative_count = int((y == 0).sum())
-    model = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            (
-                "model",
-                XGBClassifier(
-                    n_estimators=500,
-                    max_depth=3,
-                    learning_rate=0.04,
-                    min_child_weight=2,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    reg_alpha=0.05,
-                    reg_lambda=3.0,
-                    scale_pos_weight=negative_count / max(positive_count, 1),
-                    objective="binary:logistic",
-                    eval_metric="logloss",
-                    tree_method="hist",
-                    random_state=random_state,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
-    )
-    oof_probability = cross_val_predict(
-        model,
-        X,
-        y,
-        groups=groups,
-        cv=LeaveOneGroupOut(),
-        method="predict_proba",
-        n_jobs=1,
-    )[:, 1]
+    seed_probabilities: dict[int, np.ndarray] = {}
+    for seed in REGIONAL_ENSEMBLE_SEEDS:
+        seed_model = _regional_xgb_pipeline(
+            positive_count,
+            negative_count,
+            seed,
+        )
+        seed_probabilities[seed] = cross_val_predict(
+            seed_model,
+            X,
+            y,
+            groups=groups,
+            cv=LeaveOneGroupOut(),
+            method="predict_proba",
+            n_jobs=1,
+        )[:, 1]
+    oof_probability = np.mean(list(seed_probabilities.values()), axis=0)
     metrics = _edge_metrics(y, oof_probability)
     decision_threshold = float(
         metrics["optimized_threshold"]["threshold"]
     )
-    model.fit(X, y)
-    regions["regional_risk_probability"] = model.predict_proba(X)[:, 1]
-    regions["regional_risk_prediction"] = (
-        regions["regional_risk_probability"] >= decision_threshold
-    ).astype(int)
-    regions["oof_risk_probability"] = oof_probability
+
+    nested_probability, nested_prediction, nested_thresholds, fold_reports = (
+        _nested_regional_validation(X, y, groups)
+    )
+    nested_metrics = _metrics_from_predictions(
+        y,
+        nested_probability,
+        nested_prediction,
+    )
+
+    models = []
+    fitted_probabilities = []
+    seed_optimized_f1: dict[str, float] = {}
+    seed_fixed_threshold_f1: dict[str, float] = {}
+    for seed, seed_probability in seed_probabilities.items():
+        seed_metrics = _edge_metrics(y, seed_probability)
+        seed_optimized_f1[str(seed)] = float(
+            seed_metrics["optimized_threshold"]["f1"]
+        )
+        seed_fixed_threshold_f1[str(seed)] = float(
+            f1_score(
+                y,
+                seed_probability >= decision_threshold,
+                zero_division=0,
+            )
+        )
+        model = _regional_xgb_pipeline(
+            positive_count,
+            negative_count,
+            seed,
+        )
+        model.fit(X, y)
+        models.append(model)
+        fitted_probabilities.append(model.predict_proba(X)[:, 1])
+    fitted_probability = np.mean(fitted_probabilities, axis=0)
+    validation_columns = pd.DataFrame(
+        {
+            "regional_risk_probability": fitted_probability,
+            "regional_risk_prediction": (
+                fitted_probability >= decision_threshold
+            ).astype(int),
+            "oof_risk_probability": oof_probability,
+            "oof_probability_std": np.std(
+                list(seed_probabilities.values()),
+                axis=0,
+            ),
+            "nested_oof_probability": nested_probability,
+            "nested_oof_prediction": nested_prediction,
+            "nested_decision_threshold": nested_thresholds,
+        },
+        index=regions.index,
+    )
+    regions = pd.concat([regions.copy(), validation_columns], axis=1)
 
     key_columns = ["district", "region_x", "region_y"]
     segments = segments.merge(
@@ -1240,7 +1650,8 @@ def train_regional_boosting_model(
         how="left",
     )
     f1_target_achieved = (
-        float(metrics["optimized_threshold"]["f1"]) >= 0.5
+        float(nested_metrics["f1"]) >= 0.5
+        and min(seed_fixed_threshold_f1.values()) >= 0.5
     )
     regional_blend_weight = 0.25 if f1_target_achieved else 0.0
     segments["cmcs_final"] = (
@@ -1252,13 +1663,18 @@ def train_regional_boosting_model(
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(
         {
-            "model": model,
+            "models": models,
             "feature_columns": REGIONAL_MODEL_FEATURES,
             "cell_size_m": cell_size_m,
             "decision_threshold": decision_threshold,
             "regional_blend_weight": regional_blend_weight,
             "validation_metrics": metrics,
-            "validation": "LeaveOneGroupOut by Daejeon district",
+            "nested_validation_metrics": nested_metrics,
+            "ensemble_seeds": list(REGIONAL_ENSEMBLE_SEEDS),
+            "validation": (
+                "Nested LeaveOneGroupOut by Daejeon district with "
+                "fold-specific train-only threshold"
+            ),
         },
         model_path,
     )
@@ -1273,25 +1689,69 @@ def train_regional_boosting_model(
     _plot_regional_boosting_validation(y, oof_probability, chart_path)
     explain_path = CHART_OUTPUT_DIR / "regional_boosting_shap.png"
     explanation_method = _explain_model_with_features(
-        model,
+        models[0],
         X,
         REGIONAL_MODEL_FEATURES,
         explain_path,
     )
+    threshold_candidates = np.linspace(0.05, 0.95, 181)
+    stable_thresholds = [
+        float(threshold)
+        for threshold in threshold_candidates
+        if f1_score(y, oof_probability >= threshold, zero_division=0) >= 0.5
+    ]
     report = {
-        "model": "XGBoost",
+        "model": "XGBoost seed ensemble",
         "task": (
             f"{cell_size_m}m 통학 위험 권역 내 사고 다발지역 존재 여부"
         ),
         "region_count": int(len(regions)),
         "positive_region_count": positive_count,
         "positive_rate": round(float(y.mean()), 6),
-        "validation": "LeaveOneGroupOut by district",
+        "validation": (
+            "Nested LeaveOneGroupOut by district; outer district is never "
+            "used for model fitting or threshold selection"
+        ),
         "region_definition": (
             f"{cell_size_m}m grid clipped by district boundary"
         ),
         "held_out_groups": sorted(groups.unique().tolist()),
         "metrics": metrics,
+        "nested_validation_metrics": nested_metrics,
+        "per_district_nested_metrics": fold_reports,
+        "stability": {
+            "ensemble_seeds": list(REGIONAL_ENSEMBLE_SEEDS),
+            "seed_f1_at_shared_threshold": {
+                seed: round(value, 6)
+                for seed, value in seed_fixed_threshold_f1.items()
+            },
+            "seed_optimized_f1": {
+                seed: round(value, 6)
+                for seed, value in seed_optimized_f1.items()
+            },
+            "minimum_seed_f1": round(
+                min(seed_fixed_threshold_f1.values()),
+                6,
+            ),
+            "maximum_seed_f1": round(
+                max(seed_fixed_threshold_f1.values()),
+                6,
+            ),
+            "seed_f1_standard_deviation": round(
+                float(np.std(list(seed_fixed_threshold_f1.values()))),
+                6,
+            ),
+            "f1_at_least_0_5_threshold_range": [
+                round(min(stable_thresholds), 4),
+                round(max(stable_thresholds), 4),
+            ]
+            if stable_thresholds
+            else None,
+            "nested_threshold_range": [
+                round(float(nested_thresholds.min()), 6),
+                round(float(nested_thresholds.max()), 6),
+            ],
+        },
         "f1_target": 0.5,
         "f1_target_achieved": f1_target_achieved,
         "decision_threshold": round(decision_threshold, 6),
@@ -1307,6 +1767,10 @@ def train_regional_boosting_model(
             f"F1은 개별 도로가 아니라 {cell_size_m / 1000:g}km 통학 위험 "
             "권역 분류 기준이다. "
             "도로별 위험은 이 확률을 AHP·도로 모델과 결합해 산출한다."
+        ),
+        "leakage_control": (
+            "사고 건수, 사상자 수, 사고 라벨 및 사고 건수에서 파생된 CMCS "
+            "구성값은 입력 피처에서 제외했다."
         ),
     }
     path = Path(report_path)
@@ -1734,6 +2198,84 @@ def _actual_route_endpoints(data_dir: Path) -> dict[str, object]:
     }
 
 
+def _school_route_validation_pairs(
+    data_dir: Path,
+    pair_count: int = 25,
+) -> list[tuple[tuple[float, float], tuple[float, float], str, str]]:
+    schools = read_csv_flexible(next(data_dir.glob("*초중등학교위치*.csv")))
+    schools = schools[
+        schools["소재지도로명주소"].astype(str).str.contains("대전광역시")
+        & schools["학교급구분"].eq("초등학교")
+        & schools["운영상태"].eq("운영")
+    ].copy()
+    schools["위도"] = pd.to_numeric(schools["위도"], errors="coerce")
+    schools["경도"] = pd.to_numeric(schools["경도"], errors="coerce")
+    schools = schools.dropna(subset=["위도", "경도"]).drop_duplicates("학교ID")
+    schools["district"] = schools["소재지도로명주소"].map(extract_district)
+    distances = haversine_matrix(
+        schools["위도"],
+        schools["경도"],
+        schools["위도"],
+        schools["경도"],
+    )
+    index_lookup = {index: position for position, index in enumerate(schools.index)}
+    pairs = []
+    used: set[tuple[str, str]] = set()
+    per_district = max(1, math.ceil(pair_count / max(len(DISTRICTS), 1)))
+    for district in DISTRICTS:
+        district_schools = schools[schools["district"].eq(district)].sort_values(
+            "학교명"
+        )
+        if district_schools.empty:
+            continue
+        selected_positions = np.linspace(
+            0,
+            len(district_schools) - 1,
+            min(per_district, len(district_schools)),
+            dtype=int,
+        )
+        for position in selected_positions:
+            origin = district_schools.iloc[int(position)]
+            origin_position = index_lookup[origin.name]
+            candidate_positions = np.where(
+                (distances[origin_position] >= 700.0)
+                & (distances[origin_position] <= 3000.0)
+            )[0]
+            if len(candidate_positions) == 0:
+                continue
+            destination_position = int(
+                candidate_positions[
+                    np.argmin(
+                        np.abs(
+                            distances[origin_position, candidate_positions]
+                            - 1600.0
+                        )
+                    )
+                ]
+            )
+            destination = schools.iloc[destination_position]
+            pair_key = tuple(
+                sorted((str(origin["학교ID"]), str(destination["학교ID"])))
+            )
+            if pair_key in used:
+                continue
+            used.add(pair_key)
+            pairs.append(
+                (
+                    (float(origin["위도"]), float(origin["경도"])),
+                    (
+                        float(destination["위도"]),
+                        float(destination["경도"]),
+                    ),
+                    str(origin["학교명"]),
+                    str(destination["학교명"]),
+                )
+            )
+            if len(pairs) >= pair_count:
+                return pairs
+    return pairs
+
+
 def create_actual_route_map(
     graph: nx.MultiDiGraph,
     routes: list[dict[str, object]],
@@ -1882,6 +2424,80 @@ def run_actual_route_recommendation(
         json.dumps(endpoints, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    route_stability_path = REPORT_OUTPUT_DIR / "route_stability_evaluation.json"
+    validation_pairs = _school_route_validation_pairs(
+        Path(data_dir),
+        pair_count=25,
+    )
+    route_stability = batch_od_evaluation(
+        optimizer,
+        validation_pairs,
+        age_group="mid",
+        hour=8,
+        max_detour_ratio=1.6,
+        output_path=route_stability_path,
+    )
+    evaluated_count = int(len(route_stability))
+    positive_reduction_ratio = (
+        float((route_stability["risk_reduction_pct"] > 0).mean())
+        if evaluated_count
+        else 0.0
+    )
+    route_stability_summary = {
+        "ground_truth_route_f1": None,
+        "f1_not_applicable_reason": (
+            "정답 통학 경로 라벨이 없어 경로 선정 자체의 F1은 계산하지 않는다."
+        ),
+        "requested_pairs": int(len(validation_pairs)),
+        "evaluated_pairs": evaluated_count,
+        "mean_risk_reduction_pct": round(
+            float(route_stability["risk_reduction_pct"].mean()),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "median_risk_reduction_pct": round(
+            float(route_stability["risk_reduction_pct"].median()),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "positive_risk_reduction_ratio": round(
+            positive_reduction_ratio,
+            4,
+        ),
+        "mean_detour_ratio": round(
+            float(route_stability["detour_ratio"].mean()),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "p90_detour_ratio": round(
+            float(route_stability["detour_ratio"].quantile(0.90)),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "detour_exceeded_count": int(
+            route_stability["detour_exceeded"].sum()
+        )
+        if evaluated_count
+        else 0,
+    }
+    route_stability_summary["route_selection_stability_passed"] = (
+        evaluated_count >= 20
+        and positive_reduction_ratio >= 0.80
+        and route_stability_summary["median_risk_reduction_pct"] > 0
+        and route_stability_summary["detour_exceeded_count"] == 0
+    )
+    route_stability_payload = {
+        **route_stability_summary,
+        "pairs": route_stability.to_dict(orient="records"),
+    }
+    route_stability_path.write_text(
+        json.dumps(route_stability_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return {
         "endpoints": endpoints,
         "shortest": shortest,
@@ -1895,6 +2511,8 @@ def run_actual_route_recommendation(
         "pareto_chart_path": pareto_chart_path,
         "avoided_path": avoided_path,
         "endpoint_path": endpoint_path,
+        "route_stability": route_stability_summary,
+        "route_stability_path": route_stability_path,
     }
 
 
@@ -1943,6 +2561,9 @@ def run_full_pipeline(
     route_result = run_actual_route_recommendation(
         graph, final_edges, data_dir=data_dir
     )
+    cmcs_weight_report = json.loads(
+        DATA_DRIVEN_REPORT_PATH.read_text(encoding="utf-8")
+    )
 
     report = {
         "status": "completed",
@@ -1958,6 +2579,10 @@ def run_full_pipeline(
             "high_risk_edge_count": int(
                 (final_edges["cmcs_final"] >= 0.6).sum()
             ),
+            "weight_source": "data_driven_statistical",
+            "dimension_weights": cmcs_weight_report["weights"][
+                "dimension_weights"
+            ],
         },
         "model": edge_model_report,
         "edge_model": edge_model_report,
@@ -1995,6 +2620,7 @@ def run_full_pipeline(
                     )
                 )
             ),
+            "stability_validation": route_result["route_stability"],
         },
         "artifacts": {
             "edge_features": str(EDGE_FEATURE_PATH),
@@ -2003,11 +2629,17 @@ def run_full_pipeline(
             "edge_model": str(EDGE_MODEL_PATH),
             "regional_model": str(REGIONAL_MODEL_PATH),
             "regional_model_report": str(REGIONAL_MODEL_REPORT_PATH),
+            "cmcs_data_driven_weights": str(DATA_DRIVEN_WEIGHTS_PATH),
+            "cmcs_weight_evidence_report": str(DATA_DRIVEN_REPORT_PATH),
+            "cmcs_weight_evidence_chart": str(DATA_DRIVEN_CHART_PATH),
             "route_map": str(route_result["map_path"]),
             "route_comparison": str(route_result["comparison_path"]),
             "city_risk_map": str(risk_map_path),
             "route_pareto_chart": str(route_result["pareto_chart_path"]),
             "avoided_segments": str(route_result["avoided_path"]),
+            "route_stability_evaluation": str(
+                route_result["route_stability_path"]
+            ),
             "district_summary": str(
                 REPORT_OUTPUT_DIR / "district_safety_summary.csv"
             ),

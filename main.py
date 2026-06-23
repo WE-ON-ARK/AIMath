@@ -9,6 +9,8 @@ from config import (
     ensure_directories,
 )
 from src.data_collector import DataCollector, build_pedestrian_network
+from src.api_preprocessing import preprocess_existing_api_files
+from src.data_driven_cmcs import derive_data_driven_cmcs_weights
 from src.demo import run_demo
 from src.full_pipeline import (
     EDGE_FEATURE_PATH,
@@ -67,6 +69,19 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser(
         "evaluate-safety",
         help="최종 모델 안전성·적용 가능성 표와 대시보드 생성",
+    )
+    preprocess_parser = subparsers.add_parser(
+        "preprocess-api-data",
+        help="캐시된 공공데이터 API 파일의 좌표·중복·수치·시점을 표준화",
+    )
+    preprocess_parser.add_argument("--raw-dir", default="data/raw")
+    weight_parser = subparsers.add_parser(
+        "derive-cmcs-weights",
+        help="Spearman·Logistic·Poisson·Moran's I로 CMCS 가중치 산출",
+    )
+    weight_parser.add_argument(
+        "--edge-features",
+        default=str(EDGE_FEATURE_PATH),
     )
     return parser.parse_args()
 
@@ -139,7 +154,7 @@ def main() -> None:
         best_model = edge_model["best_model"]
         edge_metrics = edge_model["models"][best_model]
         regional_model = report["regional_boosting_model"]
-        regional_metrics = regional_model["metrics"]["optimized_threshold"]
+        regional_metrics = regional_model["nested_validation_metrics"]
         print("\nCMCS 전체 파이프라인 완료")
         print(
             f"도로망: 노드 {report['graph']['nodes']:,}, "
@@ -154,7 +169,7 @@ def main() -> None:
             f"운영배포={edge_model['production_deployment_ready']}"
         )
         print(
-            f"권역 부스팅: XGBoost, "
+            f"권역 부스팅: XGBoost 앙상블(중첩 검증), "
             f"F1={regional_metrics['f1']:.3f}, "
             f"Precision={regional_metrics['precision']:.3f}, "
             f"Recall={regional_metrics['recall']:.3f}, "
@@ -165,6 +180,13 @@ def main() -> None:
             f"최단 {route['shortest_distance_m']:.0f}m / "
             f"안전 {route['safest_distance_m']:.0f}m / "
             f"위험노출 감소 {route['risk_reduction_pct']:.1f}%"
+        )
+        stability = route["stability_validation"]
+        print(
+            f"다중 OD 검증: {stability['evaluated_pairs']}개, "
+            f"위험감소 경로 {stability['positive_risk_reduction_ratio'] * 100:.1f}%, "
+            f"중앙 위험감소 {stability['median_risk_reduction_pct']:.1f}%, "
+            f"안정성={stability['route_selection_stability_passed']}"
         )
         print(f"지도: {report['artifacts']['route_map']}")
     elif command == "train-edge-models":
@@ -202,7 +224,7 @@ def main() -> None:
             f"\n최종 트리 모델: {report['best_model']} / "
             f"임계값 {report['selected_decision_threshold']:.4f}"
         )
-        regional_metrics = regional_report["metrics"]["optimized_threshold"]
+        regional_metrics = regional_report["nested_validation_metrics"]
         print(
             f"권역 XGBoost: F1={regional_metrics['f1']:.4f}, "
             f"Precision={regional_metrics['precision']:.4f}, "
@@ -225,6 +247,28 @@ def main() -> None:
         )
         print(f"대시보드: {report['artifacts']['dashboard_png']}")
         print(f"HTML 보고서: {report['artifacts']['html_report']}")
+    elif command == "preprocess-api-data":
+        reports = preprocess_existing_api_files(args.raw_dir)
+        print("\n공공데이터 API 전처리 완료")
+        for name, report in reports.items():
+            print(
+                f"{name}: {report['input_rows']} → {report['output_rows']}행, "
+                f"중복 {report['duplicate_rows_removed']}건 제거, "
+                f"좌표 이상 {report['out_of_daejeon_rows']}건 제거"
+            )
+    elif command == "derive-cmcs-weights":
+        import pandas as pd
+
+        edge_features = pd.read_csv(args.edge_features)
+        weights, report = derive_data_driven_cmcs_weights(edge_features)
+        print("\n데이터 기반 CMCS 가중치 산출 완료")
+        for dimension, weight in weights.dimensions.items():
+            print(f"{dimension}: {weight:.4f}")
+        print(
+            f"Logistic 공간 ROC-AUC="
+            f"{report['analyses']['logistic']['roc_auc']:.3f}"
+        )
+        print(f"보고서: outputs/reports/cmcs_weight_evidence_report.json")
 
 
 if __name__ == "__main__":

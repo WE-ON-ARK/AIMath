@@ -9,6 +9,12 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class CMCSWeights:
+    """CMCS 선형 결합 가중치.
+
+    기본값은 과거의 휴리스틱 설계와 호환하기 위한 값이며 실제 AHP 결과가
+    아니다. 통계 기반 운영 가중치는 ``src.data_driven_cmcs``에서 산출한다.
+    """
+
     dimensions: Mapping[str, float] = field(
         default_factory=lambda: {
             "risk": 0.35,
@@ -53,10 +59,11 @@ class CMCSWeights:
             "is_school_zone": 0.04,
         }
     )
+    source: str = "manual_heuristic_legacy"
 
 
 class CMCSCalculator:
-    """AHP 기반 CMCS 점수와 구성 차원을 계산한다."""
+    """명시적으로 제공된 가중치로 CMCS 점수와 구성 차원을 계산한다."""
 
     def __init__(self, weights: CMCSWeights | None = None):
         self.weights = weights or CMCSWeights()
@@ -106,7 +113,7 @@ class CMCSCalculator:
         components["safety_bonus"] = safety_bonus
         return pd.DataFrame(components, index=features.index)
 
-    def calculate_cmcs_ahp(self, features: pd.DataFrame) -> pd.Series:
+    def calculate_cmcs(self, features: pd.DataFrame) -> pd.Series:
         components = self.calculate_components(features)
         cmcs = pd.Series(0.0, index=features.index)
         for dimension, weight in self.weights.dimensions.items():
@@ -114,12 +121,17 @@ class CMCSCalculator:
         cmcs = cmcs - components["safety_bonus"]
         return cmcs.clip(lower=0.0, upper=1.0).rename("cmcs")
 
+    def calculate_cmcs_ahp(self, features: pd.DataFrame) -> pd.Series:
+        """하위 호환 별칭. 이 함수명은 실제 AHP 검증을 의미하지 않는다."""
+        return self.calculate_cmcs(features)
+
     def score(self, features: pd.DataFrame, include_components: bool = True) -> pd.DataFrame:
         result = features.copy()
         if include_components:
             components = self.calculate_components(features).add_prefix("cmcs_")
             result = pd.concat([result, components], axis=1)
-        result["cmcs"] = self.calculate_cmcs_ahp(features)
+        result["cmcs"] = self.calculate_cmcs(features)
+        result["cmcs_weight_source"] = self.weights.source
         return result
 
     def fit_data_driven_weights(
@@ -163,6 +175,10 @@ class CMCSCalculator:
         if y.nunique() < 2:
             raise ValueError("사고 레이블에는 최소 두 개의 클래스가 필요합니다.")
 
-        model = LogisticRegression(max_iter=1000, random_state=42)
+        model = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
+            random_state=42,
+        )
         model.fit(X, y)
         return dict(zip(columns, model.coef_[0].astype(float)))

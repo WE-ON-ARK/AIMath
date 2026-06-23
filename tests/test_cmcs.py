@@ -54,3 +54,11 @@ def test_invalid_dimension_weights_are_rejected():
     with pytest.raises(ValueError):
         CMCSCalculator(weights)
 
+
+def test_legacy_ahp_name_is_only_compatibility_alias():
+    features = pd.DataFrame([{"traffic_volume_norm": 0.5}])
+    calculator = CMCSCalculator()
+    assert calculator.calculate_cmcs(features).equals(
+        calculator.calculate_cmcs_ahp(features)
+    )
+    assert calculator.weights.source == "manual_heuristic_legacy"
