@@ -249,6 +249,23 @@ config.py
 python -c "from src.model_validation import run_full_model_validation; run_full_model_validation()"
 ```
 
+최종 모델의 성능, 확률 보정, 공간·시간 일반화, 데이터 한계와 운영 적용
+범위를 한 번에 평가하려면 다음 명령을 실행합니다.
+
+```bash
+python main.py evaluate-safety
+```
+
+주요 산출물:
+
+```text
+outputs/reports/final_model_safety_evaluation.html
+outputs/reports/final_model_safety_evaluation.md
+outputs/reports/final_model_performance_metrics.csv
+outputs/reports/final_model_safety_matrix.csv
+outputs/charts/final_model_safety_dashboard.png
+```
+
 ## 다음 개발 단계
 
 - 공공데이터 API와 OSM 원천 데이터의 정기 갱신 자동화

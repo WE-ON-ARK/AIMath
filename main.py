@@ -16,6 +16,7 @@ from src.full_pipeline import (
     train_edge_risk_model,
     train_regional_boosting_model,
 )
+from src.final_model_evaluation import generate_final_model_evaluation
 from src.real_data_pipeline import run_real_data_pipeline
 
 
@@ -62,6 +63,10 @@ def parse_args() -> argparse.Namespace:
     )
     train_parser.add_argument(
         "--edge-features", default=str(EDGE_FEATURE_PATH)
+    )
+    subparsers.add_parser(
+        "evaluate-safety",
+        help="최종 모델 안전성·적용 가능성 표와 대시보드 생성",
     )
     return parser.parse_args()
 
@@ -207,6 +212,19 @@ def main() -> None:
         print(f"모델: models/edge_accident_risk_model.pkl")
         print(f"권역 모델: models/regional_xgboost_risk_model.pkl")
         print(f"구간 점수: {score_path}")
+    elif command == "evaluate-safety":
+        report = generate_final_model_evaluation()
+        metrics = report["regional_metrics"]
+        print("\n최종 모델 안전성 평가 완료")
+        print(f"종합 판정: {report['overall_verdict']}")
+        print(
+            f"권역 ROC-AUC={metrics['roc_auc']:.3f}, "
+            f"F1={metrics['f1']:.3f}, "
+            f"Precision={metrics['precision']:.3f}, "
+            f"Recall={metrics['recall']:.3f}"
+        )
+        print(f"대시보드: {report['artifacts']['dashboard_png']}")
+        print(f"HTML 보고서: {report['artifacts']['html_report']}")
 
 
 if __name__ == "__main__":
