@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import networkx as nx
@@ -103,6 +104,39 @@ def run_demo(with_visuals: bool = True) -> dict[str, object]:
         destination,
         steps=11,
         save_path=REPORT_OUTPUT_DIR / "pareto_front.csv",
+    )
+    pulse_metrics = comparison[
+        [
+            "mode",
+            "algorithm",
+            "runtime_ms",
+            "pulses_generated",
+            "states_expanded",
+            "bound_prunes",
+            "resource_prunes",
+            "dominance_prunes",
+            "optimality_proven",
+        ]
+    ]
+    pulse_metrics.to_csv(
+        REPORT_OUTPUT_DIR / "pulse_algorithm_performance.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    (REPORT_OUTPUT_DIR / "pulse_algorithm_evaluation.json").write_text(
+        json.dumps(
+            {
+                "algorithm": "pulse",
+                "dijkstra_used": False,
+                "all_optimality_proven": bool(
+                    pulse_metrics["optimality_proven"].all()
+                ),
+                "routes": pulse_metrics.to_dict(orient="records"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     nx.write_graphml(optimizer.G, GRAPH_DATA_DIR / "demo_walk.graphml")
 

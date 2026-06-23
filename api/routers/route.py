@@ -39,17 +39,29 @@ def recommend_route(req: RouteRequest) -> RouteResponse:
     tw = time_weights(req.hour)
 
     try:
+        shortest = opt.shortest_route(origin, dest)
+        max_distance_m = (
+            shortest["total_distance_m"] * profile.max_detour_ratio
+        )
         if req.mode == RouteMode.shortest:
-            route = opt.shortest_route(origin, dest)
+            route = shortest
         elif req.mode == RouteMode.safest:
-            route = opt.safest_route(origin, dest)
+            route = opt.safest_route(
+                origin,
+                dest,
+                max_distance_m=max_distance_m,
+            )
         else:
             lam = req.lam if req.lam is not None else profile.lam
-            route = opt.balanced_route(origin, dest, lam)
+            route = opt.balanced_route(
+                origin,
+                dest,
+                lam,
+                max_distance_m=max_distance_m,
+            )
     except Exception as exc:
         raise HTTPException(422, f"경로를 찾을 수 없습니다: {exc}") from exc
 
-    shortest = opt.shortest_route(origin, dest)
     detour_ratio, detour_exceeded = check_detour_ratio(
         shortest["total_distance_m"],
         route["total_distance_m"],

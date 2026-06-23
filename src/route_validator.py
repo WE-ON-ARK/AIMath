@@ -152,8 +152,20 @@ def batch_od_evaluation(
     for origin, destination, origin_label, dest_label in od_pairs:
         try:
             shortest = optimizer.shortest_route(origin, destination)
-            safest = optimizer.safest_route(origin, destination)
-            balanced = optimizer.balanced_route(origin, destination, profile.lam)
+            distance_limit = (
+                shortest["total_distance_m"] * max_detour_ratio
+            )
+            safest = optimizer.safest_route(
+                origin,
+                destination,
+                max_distance_m=distance_limit,
+            )
+            balanced = optimizer.balanced_route(
+                origin,
+                destination,
+                profile.lam,
+                max_distance_m=distance_limit,
+            )
         except Exception:
             skipped += 1
             continue
@@ -182,6 +194,17 @@ def batch_od_evaluation(
             "safest_cmcs": round(safest["total_cmcs"], 4),
             "age_group": age_group,
             "hour": hour,
+            "algorithm": "pulse",
+            "shortest_runtime_ms": shortest["search_stats"]["runtime_ms"],
+            "safest_runtime_ms": safest["search_stats"]["runtime_ms"],
+            "balanced_runtime_ms": balanced["search_stats"]["runtime_ms"],
+            "shortest_pulses": shortest["search_stats"]["pulses_generated"],
+            "safest_pulses": safest["search_stats"]["pulses_generated"],
+            "balanced_pulses": balanced["search_stats"]["pulses_generated"],
+            "pulse_optimality_proven": all(
+                route["search_stats"]["optimality_proven"]
+                for route in (shortest, safest, balanced)
+            ),
         })
 
     df = pd.DataFrame(rows)
@@ -201,6 +224,40 @@ def batch_od_evaluation(
         "detour_exceeded_count": int(df["detour_exceeded"].sum()) if len(df) else 0,
         "mean_detour_ratio": round(float(df["detour_ratio"].mean()), 4) if len(df) else 0,
         "mean_risk_reduction_pct": round(float(df["risk_reduction_pct"].mean()), 2) if len(df) else 0,
+        "algorithm": "pulse",
+        "mean_total_runtime_ms": round(
+            float(
+                df[
+                    [
+                        "shortest_runtime_ms",
+                        "safest_runtime_ms",
+                        "balanced_runtime_ms",
+                    ]
+                ].sum(axis=1).mean()
+            ),
+            4,
+        )
+        if len(df)
+        else 0,
+        "p95_total_runtime_ms": round(
+            float(
+                df[
+                    [
+                        "shortest_runtime_ms",
+                        "safest_runtime_ms",
+                        "balanced_runtime_ms",
+                    ]
+                ].sum(axis=1).quantile(0.95)
+            ),
+            4,
+        )
+        if len(df)
+        else 0,
+        "all_optimality_proven": bool(
+            df["pulse_optimality_proven"].all()
+        )
+        if len(df)
+        else False,
         "pairs": df.to_dict(orient="records"),
     }
     path = Path(output_path)

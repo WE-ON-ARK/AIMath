@@ -32,6 +32,10 @@ def test_safest_route_can_trade_distance_for_lower_risk():
     assert safest["path"] == ["A", "C", "D"]
     assert safest["total_distance_m"] > shortest["total_distance_m"]
     assert safest["total_cmcs"] < shortest["total_cmcs"]
+    assert shortest["algorithm"] == "pulse"
+    assert safest["algorithm"] == "pulse"
+    assert shortest["search_stats"]["optimality_proven"]
+    assert safest["search_stats"]["optimality_proven"]
 
 
 def test_parallel_edge_uses_the_edge_matching_route_cost():

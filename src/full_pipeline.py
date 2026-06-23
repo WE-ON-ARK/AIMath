@@ -752,9 +752,15 @@ def build_edge_feature_table(
             polygons[["district", "geometry"]],
             how="left",
         )
-        segments.loc[missing, "district"] = nearest_district[
+        # 경계에서 동일 거리의 행정구가 둘 이상 반환될 수 있으므로
+        # 원본 세그먼트 인덱스별 첫 결과로 축약한 뒤 정확히 재정렬한다.
+        nearest_map = nearest_district.groupby(level=0)[
             "district"
-        ].to_numpy()
+        ].first()
+        missing_indices = segments.index[missing]
+        segments.loc[missing_indices, "district"] = (
+            missing_indices.map(nearest_map).to_numpy()
+        )
 
     academy_counts, parking_counts = _academy_and_parking_counts(Path(data_dir))
     segments["academy_density"] = segments["district"].map(academy_counts).fillna(0)
@@ -2358,43 +2364,66 @@ def run_actual_route_recommendation(
     origin = endpoints["origin"]
     destination = endpoints["destination"]
     shortest = optimizer.shortest_route(origin, destination)
-    safest = optimizer.safest_route(origin, destination)
-    balanced = optimizer.balanced_route(origin, destination, lam=0.65)
+    max_distance_m = shortest["total_distance_m"] * 1.6
+    safest = optimizer.safest_route(
+        origin,
+        destination,
+        max_distance_m=max_distance_m,
+    )
+    balanced = optimizer.balanced_route(
+        origin,
+        destination,
+        lam=0.65,
+        max_distance_m=max_distance_m,
+    )
     routes = [shortest, safest, balanced]
 
-    comparison = optimizer.compare_routes(origin, destination)
-    balanced_row = {
-        "mode": balanced["mode"],
-        "total_distance_m": balanced["total_distance_m"],
-        "total_cmcs": balanced["total_cmcs"],
-        "average_cmcs": balanced["average_cmcs"],
-        "extra_distance_m": round(
-            balanced["total_distance_m"] - shortest["total_distance_m"], 2
-        ),
-        "cmcs_reduction_pct": round(
+    comparison_rows = []
+    for route in routes:
+        risk_reduction = (
             (
-                shortest["total_cmcs"] - balanced["total_cmcs"]
+                shortest["total_cmcs"] - route["total_cmcs"]
             )
             / shortest["total_cmcs"]
             * 100
             if shortest["total_cmcs"] > 0
-            else 0,
-            2,
-        ),
-        "num_segments": balanced["num_segments"],
-    }
-    comparison = pd.concat(
-        [
-            comparison[~comparison["mode"].str.startswith("균형")],
-            pd.DataFrame([balanced_row]),
-        ],
-        ignore_index=True,
-    )
+            else 0
+        )
+        stats = route["search_stats"]
+        comparison_rows.append(
+            {
+                "mode": route["mode"],
+                "total_distance_m": route["total_distance_m"],
+                "total_cmcs": route["total_cmcs"],
+                "average_cmcs": route["average_cmcs"],
+                "extra_distance_m": round(
+                    route["total_distance_m"]
+                    - shortest["total_distance_m"],
+                    2,
+                ),
+                "cmcs_reduction_pct": round(risk_reduction, 2),
+                "num_segments": route["num_segments"],
+                "algorithm": route["algorithm"],
+                "runtime_ms": stats["runtime_ms"],
+                "pulses_generated": stats["pulses_generated"],
+                "states_expanded": stats["states_expanded"],
+                "bound_prunes": stats["bound_prunes"],
+                "resource_prunes": stats["resource_prunes"],
+                "dominance_prunes": stats["dominance_prunes"],
+                "cycle_prunes": stats["cycle_prunes"],
+                "optimality_proven": stats["optimality_proven"],
+            }
+        )
+    comparison = pd.DataFrame(comparison_rows)
     comparison_path = REPORT_OUTPUT_DIR / "actual_route_comparison.csv"
     comparison.to_csv(comparison_path, index=False, encoding="utf-8-sig")
     pareto_path = REPORT_OUTPUT_DIR / "actual_route_pareto.csv"
     pareto = optimizer.generate_pareto_front(
-        origin, destination, steps=21, save_path=pareto_path
+        origin,
+        destination,
+        steps=21,
+        save_path=pareto_path,
+        max_distance_m=max_distance_m,
     )
     pareto_chart_path = create_pareto_chart(pareto)
     shortest_ids = set(optimizer.path_edge_ids(shortest))
@@ -2444,6 +2473,7 @@ def run_actual_route_recommendation(
         else 0.0
     )
     route_stability_summary = {
+        "algorithm": "pulse",
         "ground_truth_route_f1": None,
         "f1_not_applicable_reason": (
             "정답 통학 경로 라벨이 없어 경로 선정 자체의 F1은 계산하지 않는다."
@@ -2483,6 +2513,39 @@ def run_actual_route_recommendation(
         )
         if evaluated_count
         else 0,
+        "mean_total_runtime_ms": round(
+            float(
+                route_stability[
+                    [
+                        "shortest_runtime_ms",
+                        "safest_runtime_ms",
+                        "balanced_runtime_ms",
+                    ]
+                ].sum(axis=1).mean()
+            ),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "p95_total_runtime_ms": round(
+            float(
+                route_stability[
+                    [
+                        "shortest_runtime_ms",
+                        "safest_runtime_ms",
+                        "balanced_runtime_ms",
+                    ]
+                ].sum(axis=1).quantile(0.95)
+            ),
+            4,
+        )
+        if evaluated_count
+        else 0.0,
+        "all_optimality_proven": bool(
+            route_stability["pulse_optimality_proven"].all()
+        )
+        if evaluated_count
+        else False,
     }
     route_stability_summary["route_selection_stability_passed"] = (
         evaluated_count >= 20
@@ -2496,6 +2559,47 @@ def run_actual_route_recommendation(
     }
     route_stability_path.write_text(
         json.dumps(route_stability_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    pulse_performance_path = (
+        REPORT_OUTPUT_DIR / "pulse_algorithm_performance.csv"
+    )
+    comparison.to_csv(
+        pulse_performance_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pulse_evaluation_path = (
+        REPORT_OUTPUT_DIR / "pulse_algorithm_evaluation.json"
+    )
+    pulse_payload = {
+        "algorithm": "pulse",
+        "dijkstra_used": False,
+        "all_optimality_proven": bool(
+            all(
+                route["search_stats"]["optimality_proven"]
+                for route in routes
+            )
+            and route_stability_summary["all_optimality_proven"]
+        ),
+        "actual_route_searches": [
+            {
+                "mode": route["mode"],
+                "total_distance_m": route["total_distance_m"],
+                "total_cmcs": route["total_cmcs"],
+                **route["search_stats"],
+            }
+            for route in routes
+        ],
+        "od_evaluation": route_stability_summary,
+        "artifacts": {
+            "performance_csv": str(pulse_performance_path),
+            "od_evaluation_json": str(route_stability_path),
+            "pareto_csv": str(pareto_path),
+        },
+    }
+    pulse_evaluation_path.write_text(
+        json.dumps(pulse_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return {
@@ -2513,6 +2617,8 @@ def run_actual_route_recommendation(
         "endpoint_path": endpoint_path,
         "route_stability": route_stability_summary,
         "route_stability_path": route_stability_path,
+        "pulse_performance_path": pulse_performance_path,
+        "pulse_evaluation_path": pulse_evaluation_path,
     }
 
 
@@ -2591,6 +2697,7 @@ def run_full_pipeline(
             "f1_target_achieved"
         ],
         "route": {
+            "algorithm": "pulse",
             "origin": route_result["endpoints"]["origin_name"],
             "destination": route_result["endpoints"]["destination_name"],
             "shortest_distance_m": route_result["shortest"][
@@ -2639,6 +2746,12 @@ def run_full_pipeline(
             "avoided_segments": str(route_result["avoided_path"]),
             "route_stability_evaluation": str(
                 route_result["route_stability_path"]
+            ),
+            "pulse_algorithm_performance": str(
+                route_result["pulse_performance_path"]
+            ),
+            "pulse_algorithm_evaluation": str(
+                route_result["pulse_evaluation_path"]
             ),
             "district_summary": str(
                 REPORT_OUTPUT_DIR / "district_safety_summary.csv"

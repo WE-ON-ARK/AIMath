@@ -7,6 +7,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from src.pulse_algorithm import PulseAlgorithm
+
 
 Coordinate = tuple[float, float]
 EdgeRef = tuple[object, object, object]
@@ -33,6 +35,7 @@ class RouteOptimizer:
         if cmcs_data is None and cmcs_path is not None:
             cmcs_data = pd.read_csv(cmcs_path)
         self._assign_cmcs_weights(cmcs_data)
+        self.pulse = PulseAlgorithm(self.G)
 
     @staticmethod
     def _load_graph(graph_path: str | Path | None) -> nx.Graph:
@@ -98,15 +101,25 @@ class RouteOptimizer:
         return self._route(origin, destination, "length", "최단거리")
 
     def safest_route(
-        self, origin: Coordinate | object, destination: Coordinate | object
+        self,
+        origin: Coordinate | object,
+        destination: Coordinate | object,
+        max_distance_m: float | None = None,
     ) -> dict:
-        return self._route(origin, destination, "safety_cost", "최저위험")
+        return self._route(
+            origin,
+            destination,
+            "safety_cost",
+            "최저위험",
+            max_distance_m=max_distance_m,
+        )
 
     def balanced_route(
         self,
         origin: Coordinate | object,
         destination: Coordinate | object,
         lam: float = 0.5,
+        max_distance_m: float | None = None,
     ) -> dict:
         if not 0.0 <= lam <= 1.0:
             raise ValueError("lambda는 0과 1 사이여야 합니다.")
@@ -121,6 +134,7 @@ class RouteOptimizer:
             "balanced_cost",
             f"균형 (λ={lam:.2f})",
             extra={"lambda": lam},
+            max_distance_m=max_distance_m,
         )
 
     def _resolve_node(self, value: Coordinate | object):
@@ -137,13 +151,19 @@ class RouteOptimizer:
         cost_attribute: str,
         mode: str,
         extra: dict | None = None,
+        max_distance_m: float | None = None,
     ) -> dict:
         origin_node = self._resolve_node(origin)
         destination_node = self._resolve_node(destination)
-        path = nx.shortest_path(
-            self.G, origin_node, destination_node, weight=cost_attribute
+        search = self.pulse.solve(
+            origin_node,
+            destination_node,
+            cost_attribute,
+            resource_attribute="length",
+            max_resource=max_distance_m,
         )
-        edge_path = self._select_edge_path(path, cost_attribute)
+        path = search.path
+        edge_path = search.edge_path
         total_distance = self._sum_edges(edge_path, "length")
         total_risk_exposure = self._sum_edges(edge_path, "risk_exposure")
         average_cmcs = (
@@ -157,6 +177,10 @@ class RouteOptimizer:
             "total_cmcs": round(total_risk_exposure, 4),
             "average_cmcs": round(average_cmcs, 4),
             "num_segments": len(edge_path),
+            "algorithm": "pulse",
+            "objective_cost": round(search.objective_cost, 6),
+            "search_stats": search.stats.to_dict(),
+            "max_distance_m": max_distance_m,
         }
         if extra:
             result.update(extra)
@@ -203,12 +227,18 @@ class RouteOptimizer:
         destination: Coordinate | object,
         steps: int = 11,
         save_path: str | Path | None = None,
+        max_distance_m: float | None = None,
     ) -> pd.DataFrame:
         if steps < 2:
             raise ValueError("steps는 2 이상이어야 합니다.")
         records = []
         for lam in np.linspace(0.0, 1.0, steps):
-            route = self.balanced_route(origin, destination, float(lam))
+            route = self.balanced_route(
+                origin,
+                destination,
+                float(lam),
+                max_distance_m=max_distance_m,
+            )
             records.append(
                 {
                     "lambda": round(float(lam), 4),
@@ -216,6 +246,23 @@ class RouteOptimizer:
                     "cmcs": route["total_cmcs"],
                     "average_cmcs": route["average_cmcs"],
                     "num_segments": route["num_segments"],
+                    "runtime_ms": route["search_stats"]["runtime_ms"],
+                    "pulses_generated": route["search_stats"][
+                        "pulses_generated"
+                    ],
+                    "states_expanded": route["search_stats"][
+                        "states_expanded"
+                    ],
+                    "dominance_prunes": route["search_stats"][
+                        "dominance_prunes"
+                    ],
+                    "bound_prunes": route["search_stats"]["bound_prunes"],
+                    "resource_prunes": route["search_stats"][
+                        "resource_prunes"
+                    ],
+                    "optimality_proven": route["search_stats"][
+                        "optimality_proven"
+                    ],
                 }
             )
         result = pd.DataFrame(records).drop_duplicates(
@@ -228,12 +275,30 @@ class RouteOptimizer:
         return result
 
     def compare_routes(
-        self, origin: Coordinate | object, destination: Coordinate | object
+        self,
+        origin: Coordinate | object,
+        destination: Coordinate | object,
+        max_detour_ratio: float | None = None,
     ) -> pd.DataFrame:
+        shortest = self.shortest_route(origin, destination)
+        max_distance_m = (
+            shortest["total_distance_m"] * max_detour_ratio
+            if max_detour_ratio is not None
+            else None
+        )
         routes = [
-            self.shortest_route(origin, destination),
-            self.safest_route(origin, destination),
-            self.balanced_route(origin, destination, 0.5),
+            shortest,
+            self.safest_route(
+                origin,
+                destination,
+                max_distance_m=max_distance_m,
+            ),
+            self.balanced_route(
+                origin,
+                destination,
+                0.5,
+                max_distance_m=max_distance_m,
+            ),
         ]
         baseline = routes[0]
         rows = []
@@ -254,6 +319,24 @@ class RouteOptimizer:
                     ),
                     "cmcs_reduction_pct": round(risk_reduction, 2),
                     "num_segments": route["num_segments"],
+                    "algorithm": route["algorithm"],
+                    "runtime_ms": route["search_stats"]["runtime_ms"],
+                    "pulses_generated": route["search_stats"][
+                        "pulses_generated"
+                    ],
+                    "states_expanded": route["search_stats"][
+                        "states_expanded"
+                    ],
+                    "dominance_prunes": route["search_stats"][
+                        "dominance_prunes"
+                    ],
+                    "bound_prunes": route["search_stats"]["bound_prunes"],
+                    "resource_prunes": route["search_stats"][
+                        "resource_prunes"
+                    ],
+                    "optimality_proven": route["search_stats"][
+                        "optimality_proven"
+                    ],
                 }
             )
         return pd.DataFrame(rows)
