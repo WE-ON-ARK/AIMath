@@ -20,6 +20,8 @@ outputs/maps/*
 !outputs/maps/.gitkeep
 outputs/charts/*
 !outputs/charts/.gitkeep
+outputs/debug/*
+!outputs/debug/.gitkeep
 outputs/reports/*
 !outputs/reports/.gitkeep
 outputs/refresh.log

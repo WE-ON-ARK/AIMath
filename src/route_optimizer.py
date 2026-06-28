@@ -7,7 +7,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from src.pulse_algorithm import PulseAlgorithm
+from src.aco_pareto_rcsp import HybridACOParetoRCSP
 
 
 Coordinate = tuple[float, float]
@@ -25,17 +25,26 @@ class RouteOptimizer:
         cmcs_path: str | Path | None = None,
         default_cmcs: float = 0.5,
         risk_floor: float = 0.05,
+        algorithm: str = "aco_pareto_rcsp",
+        route_time_budget_s: float | None = None,
     ):
         if graph is None and graph_path is None:
             raise ValueError("graph 또는 graph_path 중 하나가 필요합니다.")
         self.G = graph.copy() if graph is not None else self._load_graph(graph_path)
         self.default_cmcs = float(default_cmcs)
         self.risk_floor = float(risk_floor)
+        if algorithm not in {"aco_pareto_rcsp", "bidirectional", "pulse"}:
+            raise ValueError("algorithm must be 'aco_pareto_rcsp'")
+        self._algorithm_name = "aco_pareto_rcsp"
+        self._requested_algorithm = algorithm
+        # 경로 1건당 탐색 시간 상한(anytime 안전망). 초과 시 현재까지 찾은
+        # 최적 incumbent(시드가 빠르게 최적값을 찾으므로 보통 최적값)를 반환한다.
+        self._route_time_budget_s = route_time_budget_s
 
         if cmcs_data is None and cmcs_path is not None:
             cmcs_data = pd.read_csv(cmcs_path)
         self._assign_cmcs_weights(cmcs_data)
-        self.pulse = PulseAlgorithm(self.G)
+        self.router = HybridACOParetoRCSP(self.G)
 
     @staticmethod
     def _load_graph(graph_path: str | Path | None) -> nx.Graph:
@@ -155,12 +164,13 @@ class RouteOptimizer:
     ) -> dict:
         origin_node = self._resolve_node(origin)
         destination_node = self._resolve_node(destination)
-        search = self.pulse.solve(
+        search = self.router.solve(
             origin_node,
             destination_node,
             cost_attribute,
             resource_attribute="length",
             max_resource=max_distance_m,
+            time_budget_s=self._route_time_budget_s,
         )
         path = search.path
         edge_path = search.edge_path
@@ -177,9 +187,35 @@ class RouteOptimizer:
             "total_cmcs": round(total_risk_exposure, 4),
             "average_cmcs": round(average_cmcs, 4),
             "num_segments": len(edge_path),
-            "algorithm": "pulse",
+            "algorithm": search.search_stats["algorithm"],
+            "selected_source": search.selected_source,
+            "optimality_proven": search.optimality_proven,
+            "optimality_claim_scope": search.optimality_claim_scope,
+            "aco_found_feasible": search.aco_found_feasible,
+            "aco_objective": search.aco_objective,
+            "aco_total_distance": search.aco_total_distance,
+            "aco_total_cmcs": search.aco_total_cmcs,
+            "aco_feasible_solutions": search.aco_feasible_solutions,
+            "pure_aco_feasible_solutions": search.pure_aco_feasible_solutions,
+            "seeded_feasible_solutions": search.seeded_feasible_solutions,
+            "rcsp_objective": search.rcsp_objective,
+            "rcsp_total_distance": search.rcsp_total_distance,
+            "rcsp_total_cmcs": search.rcsp_total_cmcs,
+            "rcsp_used_aco_upper_bound": search.rcsp_used_aco_upper_bound,
+            "initial_upper_bound_source": search.initial_upper_bound_source,
+            "detour_ratio": search.detour_ratio,
+            "detour_constraint_satisfied": search.detour_constraint_satisfied,
+            "risk_reduction_pct_against_shortest": (
+                search.risk_reduction_pct_against_shortest
+            ),
+            "distance_increase_pct_against_shortest": (
+                search.distance_increase_pct_against_shortest
+            ),
             "objective_cost": round(search.objective_cost, 6),
-            "search_stats": search.stats.to_dict(),
+            "search_stats": search.search_stats,
+            "aco_stats": search.aco_stats,
+            "rcsp_stats": search.rcsp_stats,
+            "gap_pct": search.gap_pct,
             "max_distance_m": max_distance_m,
         }
         if extra:
@@ -247,21 +283,26 @@ class RouteOptimizer:
                     "average_cmcs": route["average_cmcs"],
                     "num_segments": route["num_segments"],
                     "runtime_ms": route["search_stats"]["runtime_ms"],
-                    "pulses_generated": route["search_stats"][
-                        "pulses_generated"
-                    ],
-                    "states_expanded": route["search_stats"][
-                        "states_expanded"
-                    ],
+                    "aco_runtime_ms": route["search_stats"]["aco_runtime_ms"],
+                    "rcsp_runtime_ms": route["search_stats"]["rcsp_runtime_ms"],
+                    "selected_source": route["selected_source"],
+                    "gap_pct": route["gap_pct"],
+                    "ants_total": route["search_stats"]["ants_total"],
+                    "labels_created": route["search_stats"]["labels_created"],
+                    "labels_expanded": route["search_stats"]["labels_expanded"],
                     "dominance_prunes": route["search_stats"][
                         "dominance_prunes"
                     ],
-                    "bound_prunes": route["search_stats"]["bound_prunes"],
                     "resource_prunes": route["search_stats"][
                         "resource_prunes"
                     ],
-                    "optimality_proven": route["search_stats"][
-                        "optimality_proven"
+                    "upper_bound_prunes": route["search_stats"][
+                        "upper_bound_prunes"
+                    ],
+                    "optimality_proven": route["optimality_proven"],
+                    "detour_ratio": route["detour_ratio"],
+                    "detour_constraint_satisfied": route[
+                        "detour_constraint_satisfied"
                     ],
                 }
             )
@@ -311,32 +352,70 @@ class RouteOptimizer:
             rows.append(
                 {
                     "mode": route["mode"],
+                    "path": route["path"],
+                    "edge_path": route["edge_path"],
                     "total_distance_m": route["total_distance_m"],
                     "total_cmcs": route["total_cmcs"],
                     "average_cmcs": route["average_cmcs"],
+                    "objective_cost": route["objective_cost"],
                     "extra_distance_m": round(
                         route["total_distance_m"] - baseline["total_distance_m"], 2
                     ),
                     "cmcs_reduction_pct": round(risk_reduction, 2),
                     "num_segments": route["num_segments"],
                     "algorithm": route["algorithm"],
+                    "selected_source": route["selected_source"],
+                    "optimality_proven": route["optimality_proven"],
+                    "optimality_claim_scope": route["optimality_claim_scope"],
+                    "aco_found_feasible": route["aco_found_feasible"],
+                    "aco_objective": route["aco_objective"],
+                    "aco_total_distance": route["aco_total_distance"],
+                    "aco_total_cmcs": route["aco_total_cmcs"],
+                    "aco_feasible_solutions": route["aco_feasible_solutions"],
+                    "pure_aco_feasible_solutions": route[
+                        "pure_aco_feasible_solutions"
+                    ],
+                    "seeded_feasible_solutions": route[
+                        "seeded_feasible_solutions"
+                    ],
+                    "rcsp_objective": route["rcsp_objective"],
+                    "rcsp_total_distance": route["rcsp_total_distance"],
+                    "rcsp_total_cmcs": route["rcsp_total_cmcs"],
+                    "rcsp_used_aco_upper_bound": route[
+                        "rcsp_used_aco_upper_bound"
+                    ],
+                    "initial_upper_bound_source": route[
+                        "initial_upper_bound_source"
+                    ],
+                    "detour_ratio": route["detour_ratio"],
+                    "detour_constraint_satisfied": route[
+                        "detour_constraint_satisfied"
+                    ],
+                    "risk_reduction_pct_against_shortest": route[
+                        "risk_reduction_pct_against_shortest"
+                    ],
+                    "distance_increase_pct_against_shortest": route[
+                        "distance_increase_pct_against_shortest"
+                    ],
+                    "gap_pct": route["gap_pct"],
                     "runtime_ms": route["search_stats"]["runtime_ms"],
-                    "pulses_generated": route["search_stats"][
-                        "pulses_generated"
-                    ],
-                    "states_expanded": route["search_stats"][
-                        "states_expanded"
-                    ],
+                    "aco_runtime_ms": route["search_stats"]["aco_runtime_ms"],
+                    "rcsp_runtime_ms": route["search_stats"]["rcsp_runtime_ms"],
+                    "ants_total": route["search_stats"]["ants_total"],
+                    "labels_created": route["search_stats"]["labels_created"],
+                    "labels_expanded": route["search_stats"]["labels_expanded"],
                     "dominance_prunes": route["search_stats"][
                         "dominance_prunes"
                     ],
-                    "bound_prunes": route["search_stats"]["bound_prunes"],
                     "resource_prunes": route["search_stats"][
                         "resource_prunes"
                     ],
-                    "optimality_proven": route["search_stats"][
-                        "optimality_proven"
+                    "upper_bound_prunes": route["search_stats"][
+                        "upper_bound_prunes"
                     ],
+                    "search_stats": route["search_stats"],
+                    "aco_stats": route["aco_stats"],
+                    "rcsp_stats": route["rcsp_stats"],
                 }
             )
         return pd.DataFrame(rows)

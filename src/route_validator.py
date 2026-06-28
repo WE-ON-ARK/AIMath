@@ -194,16 +194,65 @@ def batch_od_evaluation(
             "safest_cmcs": round(safest["total_cmcs"], 4),
             "age_group": age_group,
             "hour": hour,
-            "algorithm": "pulse",
+            "algorithm": shortest["algorithm"],
             "shortest_runtime_ms": shortest["search_stats"]["runtime_ms"],
             "safest_runtime_ms": safest["search_stats"]["runtime_ms"],
             "balanced_runtime_ms": balanced["search_stats"]["runtime_ms"],
-            "shortest_pulses": shortest["search_stats"]["pulses_generated"],
-            "safest_pulses": safest["search_stats"]["pulses_generated"],
-            "balanced_pulses": balanced["search_stats"]["pulses_generated"],
-            "pulse_optimality_proven": all(
-                route["search_stats"]["optimality_proven"]
+            "shortest_ants_total": shortest["search_stats"]["ants_total"],
+            "safest_ants_total": safest["search_stats"]["ants_total"],
+            "balanced_ants_total": balanced["search_stats"]["ants_total"],
+            "shortest_labels_expanded": shortest["search_stats"][
+                "labels_expanded"
+            ],
+            "safest_labels_expanded": safest["search_stats"]["labels_expanded"],
+            "balanced_labels_expanded": balanced["search_stats"][
+                "labels_expanded"
+            ],
+            "aco_success_rate": float(
+                np.mean(
+                    [
+                        (
+                            route["aco_stats"]["pure_aco_feasible_solutions"]
+                            + route["aco_stats"]["seeded_feasible_solutions"]
+                        )
+                        / max(1, route["aco_stats"]["ants_total"])
+                        for route in (shortest, safest, balanced)
+                    ]
+                )
+            ),
+            "pure_aco_feasible_solutions": int(
+                sum(
+                    route["aco_stats"]["pure_aco_feasible_solutions"]
+                    for route in (shortest, safest, balanced)
+                )
+            ),
+            "seeded_feasible_solutions": int(
+                sum(
+                    route["aco_stats"]["seeded_feasible_solutions"]
+                    for route in (shortest, safest, balanced)
+                )
+            ),
+            "aco_found_feasible": any(
+                route["aco_stats"]["aco_found_feasible"]
                 for route in (shortest, safest, balanced)
+            ),
+            "rcsp_certified": all(
+                route["selected_source"] == "rcsp_certified"
+                and route["optimality_proven"]
+                for route in (shortest, safest, balanced)
+            ),
+            "optimality_proven": all(
+                route["optimality_proven"] for route in (shortest, safest, balanced)
+            ),
+            "mean_gap_pct": float(
+                np.mean(
+                    [
+                        route["gap_pct"]
+                        for route in (shortest, safest, balanced)
+                        if route["gap_pct"] is not None
+                    ]
+                    or [0.0]
+                )
             ),
         })
 
@@ -224,7 +273,7 @@ def batch_od_evaluation(
         "detour_exceeded_count": int(df["detour_exceeded"].sum()) if len(df) else 0,
         "mean_detour_ratio": round(float(df["detour_ratio"].mean()), 4) if len(df) else 0,
         "mean_risk_reduction_pct": round(float(df["risk_reduction_pct"].mean()), 2) if len(df) else 0,
-        "algorithm": "pulse",
+        "algorithm": df["algorithm"].iloc[0] if len(df) else "aco_pareto_rcsp",
         "mean_total_runtime_ms": round(
             float(
                 df[
@@ -254,7 +303,7 @@ def batch_od_evaluation(
         if len(df)
         else 0,
         "all_optimality_proven": bool(
-            df["pulse_optimality_proven"].all()
+            df["optimality_proven"].all()
         )
         if len(df)
         else False,

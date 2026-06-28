@@ -32,8 +32,10 @@ def test_safest_route_can_trade_distance_for_lower_risk():
     assert safest["path"] == ["A", "C", "D"]
     assert safest["total_distance_m"] > shortest["total_distance_m"]
     assert safest["total_cmcs"] < shortest["total_cmcs"]
-    assert shortest["algorithm"] == "pulse"
-    assert safest["algorithm"] == "pulse"
+    assert shortest["algorithm"] == "aco_pareto_rcsp"
+    assert safest["algorithm"] == "aco_pareto_rcsp"
+    assert shortest["selected_source"] == "rcsp_certified"
+    assert safest["selected_source"] == "rcsp_certified"
     assert shortest["search_stats"]["optimality_proven"]
     assert safest["search_stats"]["optimality_proven"]
 

@@ -46,6 +46,37 @@ def _read_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _artifact_ref(path: str | Path) -> str:
+    path = Path(path)
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _default_temporal_report() -> dict[str, object]:
+    return {
+        "metrics": {"roc_auc": 0.0, "brier_score": 1.0},
+        "dummy_brier_score": 1.0,
+        "fallback_reason": "temporal_split_report.json was not generated",
+    }
+
+
+def _default_quality_report() -> dict[str, object]:
+    return {
+        "coordinate_quality": {
+            "fallback": {
+                "pass_rate": 0.0,
+                "reason": "data_quality_report.json was not generated",
+            }
+        }
+    }
+
+
+def _read_json_or_default(path: Path, default: dict[str, object]) -> dict[str, object]:
+    return _read_json(path) if path.exists() else default
+
+
 def _bootstrap_intervals(
     target: np.ndarray,
     probability: np.ndarray,
@@ -831,8 +862,14 @@ def generate_final_model_evaluation() -> dict[str, object]:
         REPORT_OUTPUT_DIR / "regional_boosting_report.json"
     )
     route_report = _read_json(REPORT_OUTPUT_DIR / "full_pipeline_report.json")
-    temporal_report = _read_json(REPORT_OUTPUT_DIR / "temporal_split_report.json")
-    quality_report = _read_json(REPORT_OUTPUT_DIR / "data_quality_report.json")
+    temporal_report = _read_json_or_default(
+        REPORT_OUTPUT_DIR / "temporal_split_report.json",
+        _default_temporal_report(),
+    )
+    quality_report = _read_json_or_default(
+        REPORT_OUTPUT_DIR / "data_quality_report.json",
+        _default_quality_report(),
+    )
     predictions = pd.read_csv(
         REPORT_OUTPUT_DIR / "regional_boosting_predictions.csv"
     )
@@ -891,11 +928,11 @@ def generate_final_model_evaluation() -> dict[str, object]:
         "safety_gate_counts": safety["상태"].value_counts().to_dict(),
         "recommendations": _recommendations(),
         "artifacts": {
-            "performance_csv": str(PERFORMANCE_CSV),
-            "safety_matrix_csv": str(SAFETY_MATRIX_CSV),
-            "markdown_report": str(EVALUATION_MD),
-            "html_report": str(EVALUATION_HTML),
-            "dashboard_png": str(DASHBOARD_PNG),
+            "performance_csv": _artifact_ref(PERFORMANCE_CSV),
+            "safety_matrix_csv": _artifact_ref(SAFETY_MATRIX_CSV),
+            "markdown_report": _artifact_ref(EVALUATION_MD),
+            "html_report": _artifact_ref(EVALUATION_HTML),
+            "dashboard_png": _artifact_ref(DASHBOARD_PNG),
         },
     }
     EVALUATION_JSON.write_text(

@@ -89,6 +89,8 @@ def build_demo_graph(size: int = 5) -> tuple[nx.MultiDiGraph, pd.DataFrame]:
 
 def run_demo(with_visuals: bool = True) -> dict[str, object]:
     ensure_directories()
+    debug_dir = Path("outputs/debug")
+    debug_dir.mkdir(parents=True, exist_ok=True)
     graph, features = build_demo_graph()
     scored = CMCSCalculator().score(features)
     scored.to_csv(PROCESSED_DATA_DIR / "edge_cmcs.csv", index=False)
@@ -98,40 +100,57 @@ def run_demo(with_visuals: bool = True) -> dict[str, object]:
     shortest = optimizer.shortest_route(origin, destination)
     safest = optimizer.safest_route(origin, destination)
     comparison = optimizer.compare_routes(origin, destination)
-    comparison.to_csv(REPORT_OUTPUT_DIR / "route_comparison.csv", index=False)
+    comparison.to_csv(debug_dir / "route_comparison.csv", index=False)
     pareto = optimizer.generate_pareto_front(
         origin,
         destination,
         steps=11,
-        save_path=REPORT_OUTPUT_DIR / "pareto_front.csv",
+        save_path=debug_dir / "pareto_front.csv",
     )
-    pulse_metrics = comparison[
+    algorithm_metrics = comparison[
         [
             "mode",
             "algorithm",
+            "selected_source",
+            "aco_found_feasible",
+            "aco_objective",
+            "aco_total_distance",
+            "aco_total_cmcs",
+            "aco_feasible_solutions",
+            "pure_aco_feasible_solutions",
+            "seeded_feasible_solutions",
+            "rcsp_objective",
+            "rcsp_total_distance",
+            "rcsp_total_cmcs",
+            "rcsp_used_aco_upper_bound",
+            "initial_upper_bound_source",
+            "optimality_claim_scope",
             "runtime_ms",
-            "pulses_generated",
-            "states_expanded",
-            "bound_prunes",
+            "aco_runtime_ms",
+            "rcsp_runtime_ms",
+            "ants_total",
+            "labels_created",
+            "labels_expanded",
+            "upper_bound_prunes",
             "resource_prunes",
             "dominance_prunes",
             "optimality_proven",
+            "gap_pct",
         ]
     ]
-    pulse_metrics.to_csv(
-        REPORT_OUTPUT_DIR / "pulse_algorithm_performance.csv",
+    algorithm_metrics.to_csv(
+        REPORT_OUTPUT_DIR / "aco_pareto_algorithm_performance.csv",
         index=False,
         encoding="utf-8-sig",
     )
-    (REPORT_OUTPUT_DIR / "pulse_algorithm_evaluation.json").write_text(
+    (REPORT_OUTPUT_DIR / "aco_pareto_algorithm_evaluation.json").write_text(
         json.dumps(
             {
-                "algorithm": "pulse",
-                "dijkstra_used": False,
+                "algorithm": "aco_pareto_rcsp",
                 "all_optimality_proven": bool(
-                    pulse_metrics["optimality_proven"].all()
+                    algorithm_metrics["optimality_proven"].all()
                 ),
-                "routes": pulse_metrics.to_dict(orient="records"),
+                "routes": algorithm_metrics.to_dict(orient="records"),
             },
             ensure_ascii=False,
             indent=2,

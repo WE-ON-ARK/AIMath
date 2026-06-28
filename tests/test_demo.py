@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from src.demo import run_demo
 
 
@@ -17,5 +19,5 @@ def test_demo_generates_safer_alternative(tmp_path, monkeypatch):
     result = run_demo(with_visuals=False)
     assert result["safest"]["total_cmcs"] < result["shortest"]["total_cmcs"]
     assert (tmp_path / "processed" / "edge_cmcs.csv").exists()
-    assert (tmp_path / "reports" / "route_comparison.csv").exists()
+    assert (Path("outputs/debug") / "route_comparison.csv").exists()
 

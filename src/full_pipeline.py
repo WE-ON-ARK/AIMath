@@ -89,6 +89,34 @@ REGIONAL_CELL_SIZE_M = 1750
 REGIONAL_ENSEMBLE_SEEDS = (7, 17, 29, 42, 61, 91, 113)
 REGIONAL_NESTED_SEEDS = (17, 42, 91)
 
+
+def _artifact_ref(path: str | Path) -> str:
+    path = Path(path)
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _relative_report_paths(value):
+    if isinstance(value, dict):
+        return {key: _relative_report_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_relative_report_paths(item) for item in value]
+    if isinstance(value, str):
+        cwd = Path.cwd().resolve()
+        text = value.replace("\\", "/")
+        cwd_text = cwd.as_posix()
+        if text.startswith(cwd_text):
+            return text[len(cwd_text) + 1 :]
+        try:
+            path = Path(value)
+            if path.is_absolute():
+                return path.resolve().relative_to(cwd).as_posix()
+        except (OSError, ValueError):
+            pass
+    return value
+
 EDGE_MODEL_FEATURES = [
     "traffic_volume_norm",
     "avg_speed_norm",
@@ -2351,6 +2379,87 @@ def create_actual_route_map(
     return path
 
 
+# 경로 1건당 양방향 Pulse 탐색 시간 상한(초). 안전비용 목적은 하한이 약해
+# 긴 OD에서 최적성 증명에 오래 걸릴 수 있다. 시드가 최적값을 빠르게 찾으므로
+# 예산을 초과해도 반환 경로값은 사실상 최적이며 "증명"만 생략된다.
+ROUTE_TIME_BUDGET_S = 60.0
+# OD 경로 선정 안정성 검증 쌍 수. 각 쌍이 안전비용 목적의 약한 하한 탐색을
+# 2회(safest+balanced) 수행하므로 쌍 수가 전체 실행시간을 지배한다.
+OD_VALIDATION_PAIRS = 8
+OD_VALIDATION_MIN_EVALUATED = 6
+
+
+def _route_algorithm_summary_markdown(
+    routes: list[dict[str, object]],
+    stability: dict[str, object],
+    evaluation_path: Path,
+    rcsp_report_path: Path,
+) -> str:
+    route_rows = "\n".join(
+        (
+            f"| {route['mode']} | {route['selected_source']} | "
+            f"{route['total_distance_m']:.2f} | {route['total_cmcs']:.4f} | "
+            f"{route['objective_cost']:.6f} | {route['gap_pct']} | "
+            f"{route['optimality_proven']} |"
+        )
+        for route in routes
+    )
+    return f"""# ACO-Pareto RCSP Route Algorithm Summary
+
+## Algorithm
+
+The final route search engine is `aco_pareto_rcsp`.
+Ant Colony Optimization first finds a feasible candidate and supplies its
+objective value as an initial upper bound. Pareto Label-Correcting RCSP then
+searches the constrained label space to improve or certify the incumbent.
+
+## Mathematical Formulation
+
+- Route distance: `L(P) = sum(length_e for e in P)`
+- Route risk cost: `C(P) = sum(safety_cost_e for e in P)`
+- Detour constraint: `L(P) <= L(P_shortest) * r_age`
+- Balanced objective: `Score_lambda(P) = lambda * L(P) + (1 - lambda) * C(P)`
+- Pareto dominance: for labels A and B at the same node, B is removed when
+  `L_A <= L_B`, `C_A <= C_B`, and at least one inequality is strict.
+- If RCSP exhausts the search space, then
+  `C(P_RCSP) = min C(P), subject to L(P) <= B`.
+- ACO does not guarantee global optimality by itself. Final reliability is
+  reported through RCSP certification when available, or through the measured
+  ACO-vs-RCSP gap when the RCSP pass times out.
+- ACO는 확률적 후보 경로와 초기 상한을 제공하고, Pareto
+  Label-Correcting RCSP가 지정된 탐색 범위에서 종료되는 경우 해당
+  범위 내 최적성을 인증한다.
+
+## Actual Route Runs
+
+| Mode | Selected source | Distance m | CMCS exposure | Objective | Gap pct | Certified |
+|---|---:|---:|---:|---:|---:|---:|
+{route_rows}
+
+## OD Stability
+
+- Evaluated pairs: {stability.get('evaluated_pairs', 0)}
+- Skipped pairs: {stability.get('skipped_pairs', 0)}
+- Mean detour ratio: {stability.get('mean_detour_ratio', 0)}
+- P95 detour ratio: {stability.get('p95_detour_ratio', 0)}
+- Detour constraint satisfaction rate: {stability.get('detour_constraint_satisfaction_rate', 0)}
+- Mean risk reduction pct: {stability.get('mean_risk_reduction_pct', 0)}
+- Median risk reduction pct: {stability.get('median_risk_reduction_pct', 0)}
+- Positive risk reduction ratio: {stability.get('positive_risk_reduction_ratio', 0)}
+- Mean runtime ms: {stability.get('mean_runtime_ms', 0)}
+- P95 runtime ms: {stability.get('p95_runtime_ms', 0)}
+- ACO success rate: {stability.get('aco_success_rate', 0)}
+- RCSP certification rate: {stability.get('rcsp_certification_rate', 0)}
+- Mean gap pct: {stability.get('mean_gap_pct', 0)}
+- P95 gap pct: {stability.get('p95_gap_pct', 0)}
+
+## Artifacts
+
+- Evaluation JSON: `{_artifact_ref(evaluation_path)}`
+- RCSP certification JSON: `{_artifact_ref(rcsp_report_path)}`
+"""
+
+
 def run_actual_route_recommendation(
     graph: nx.MultiDiGraph,
     edge_scores: pd.DataFrame,
@@ -2360,7 +2469,11 @@ def run_actual_route_recommendation(
     cmcs = edge_scores[["edge_id", "cmcs_final"]].rename(
         columns={"cmcs_final": "cmcs"}
     )
-    optimizer = RouteOptimizer(graph=graph, cmcs_data=cmcs)
+    optimizer = RouteOptimizer(
+        graph=graph,
+        cmcs_data=cmcs,
+        route_time_budget_s=ROUTE_TIME_BUDGET_S,
+    )
     origin = endpoints["origin"]
     destination = endpoints["destination"]
     shortest = optimizer.shortest_route(origin, destination)
@@ -2404,14 +2517,50 @@ def run_actual_route_recommendation(
                 "cmcs_reduction_pct": round(risk_reduction, 2),
                 "num_segments": route["num_segments"],
                 "algorithm": route["algorithm"],
+                "selected_source": route["selected_source"],
+                "objective_cost": route["objective_cost"],
+                "optimality_proven": route["optimality_proven"],
+                "optimality_claim_scope": route["optimality_claim_scope"],
+                "aco_found_feasible": route["aco_found_feasible"],
+                "aco_objective": route["aco_objective"],
+                "aco_total_distance": route["aco_total_distance"],
+                "aco_total_cmcs": route["aco_total_cmcs"],
+                "aco_feasible_solutions": route["aco_feasible_solutions"],
+                "pure_aco_feasible_solutions": route[
+                    "pure_aco_feasible_solutions"
+                ],
+                "seeded_feasible_solutions": route[
+                    "seeded_feasible_solutions"
+                ],
+                "rcsp_objective": route["rcsp_objective"],
+                "rcsp_total_distance": route["rcsp_total_distance"],
+                "rcsp_total_cmcs": route["rcsp_total_cmcs"],
+                "rcsp_used_aco_upper_bound": route[
+                    "rcsp_used_aco_upper_bound"
+                ],
+                "initial_upper_bound_source": route[
+                    "initial_upper_bound_source"
+                ],
+                "gap_pct": route["gap_pct"],
+                "detour_ratio": route["detour_ratio"],
+                "detour_constraint_satisfied": route[
+                    "detour_constraint_satisfied"
+                ],
+                "risk_reduction_pct_against_shortest": route[
+                    "risk_reduction_pct_against_shortest"
+                ],
+                "distance_increase_pct_against_shortest": route[
+                    "distance_increase_pct_against_shortest"
+                ],
                 "runtime_ms": stats["runtime_ms"],
-                "pulses_generated": stats["pulses_generated"],
-                "states_expanded": stats["states_expanded"],
-                "bound_prunes": stats["bound_prunes"],
+                "aco_runtime_ms": stats["aco_runtime_ms"],
+                "rcsp_runtime_ms": stats["rcsp_runtime_ms"],
+                "ants_total": stats["ants_total"],
+                "labels_created": stats["labels_created"],
+                "labels_expanded": stats["labels_expanded"],
+                "upper_bound_prunes": stats["upper_bound_prunes"],
                 "resource_prunes": stats["resource_prunes"],
                 "dominance_prunes": stats["dominance_prunes"],
-                "cycle_prunes": stats["cycle_prunes"],
-                "optimality_proven": stats["optimality_proven"],
             }
         )
     comparison = pd.DataFrame(comparison_rows)
@@ -2456,7 +2605,7 @@ def run_actual_route_recommendation(
     route_stability_path = REPORT_OUTPUT_DIR / "route_stability_evaluation.json"
     validation_pairs = _school_route_validation_pairs(
         Path(data_dir),
-        pair_count=25,
+        pair_count=OD_VALIDATION_PAIRS,
     )
     route_stability = batch_od_evaluation(
         optimizer,
@@ -2472,8 +2621,9 @@ def run_actual_route_recommendation(
         if evaluated_count
         else 0.0
     )
+    _algo_name = route_stability["algorithm"].iloc[0] if evaluated_count else "aco_pareto_rcsp"
     route_stability_summary = {
-        "algorithm": "pulse",
+        "algorithm": _algo_name,
         "ground_truth_route_f1": None,
         "f1_not_applicable_reason": (
             "정답 통학 경로 라벨이 없어 경로 선정 자체의 F1은 계산하지 않는다."
@@ -2542,13 +2692,68 @@ def run_actual_route_recommendation(
         if evaluated_count
         else 0.0,
         "all_optimality_proven": bool(
-            route_stability["pulse_optimality_proven"].all()
+            route_stability["optimality_proven"].all()
         )
         if evaluated_count
         else False,
     }
+    if evaluated_count:
+        total_runtime = route_stability[
+            [
+                "shortest_runtime_ms",
+                "safest_runtime_ms",
+                "balanced_runtime_ms",
+            ]
+        ].sum(axis=1)
+        route_stability_summary.update(
+            {
+                "skipped_pairs": int(
+                    len(validation_pairs) - evaluated_count
+                ),
+                "p95_detour_ratio": round(
+                    float(route_stability["detour_ratio"].quantile(0.95)),
+                    4,
+                ),
+                "detour_constraint_satisfaction_rate": round(
+                    float((~route_stability["detour_exceeded"]).mean()),
+                    6,
+                ),
+                "mean_runtime_ms": round(float(total_runtime.mean()), 4),
+                "p95_runtime_ms": round(float(total_runtime.quantile(0.95)), 4),
+                "aco_success_rate": round(
+                    float(route_stability["aco_success_rate"].mean()),
+                    6,
+                ),
+                "rcsp_certification_rate": round(
+                    float(route_stability["rcsp_certified"].mean()),
+                    6,
+                ),
+                "mean_gap_pct": round(
+                    float(route_stability["mean_gap_pct"].mean()),
+                    6,
+                ),
+                "p95_gap_pct": round(
+                    float(route_stability["mean_gap_pct"].quantile(0.95)),
+                    6,
+                ),
+            }
+        )
+    else:
+        route_stability_summary.update(
+            {
+                "skipped_pairs": int(len(validation_pairs)),
+                "p95_detour_ratio": 0.0,
+                "detour_constraint_satisfaction_rate": 0.0,
+                "mean_runtime_ms": 0.0,
+                "p95_runtime_ms": 0.0,
+                "aco_success_rate": 0.0,
+                "rcsp_certification_rate": 0.0,
+                "mean_gap_pct": 0.0,
+                "p95_gap_pct": 0.0,
+            }
+        )
     route_stability_summary["route_selection_stability_passed"] = (
-        evaluated_count >= 20
+        evaluated_count >= OD_VALIDATION_MIN_EVALUATED
         and positive_reduction_ratio >= 0.80
         and route_stability_summary["median_risk_reduction_pct"] > 0
         and route_stability_summary["detour_exceeded_count"] == 0
@@ -2561,20 +2766,21 @@ def run_actual_route_recommendation(
         json.dumps(route_stability_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    pulse_performance_path = (
-        REPORT_OUTPUT_DIR / "pulse_algorithm_performance.csv"
+    od_algorithm_path = REPORT_OUTPUT_DIR / "od_algorithm_evaluation.csv"
+    route_stability.to_csv(od_algorithm_path, index=False, encoding="utf-8-sig")
+    aco_performance_path = (
+        REPORT_OUTPUT_DIR / "aco_pareto_algorithm_performance.csv"
     )
     comparison.to_csv(
-        pulse_performance_path,
+        aco_performance_path,
         index=False,
         encoding="utf-8-sig",
     )
-    pulse_evaluation_path = (
-        REPORT_OUTPUT_DIR / "pulse_algorithm_evaluation.json"
+    aco_evaluation_path = (
+        REPORT_OUTPUT_DIR / "aco_pareto_algorithm_evaluation.json"
     )
-    pulse_payload = {
-        "algorithm": "pulse",
-        "dijkstra_used": False,
+    aco_payload = {
+        "algorithm": routes[0]["algorithm"],
         "all_optimality_proven": bool(
             all(
                 route["search_stats"]["optimality_proven"]
@@ -2593,13 +2799,95 @@ def run_actual_route_recommendation(
         ],
         "od_evaluation": route_stability_summary,
         "artifacts": {
-            "performance_csv": str(pulse_performance_path),
-            "od_evaluation_json": str(route_stability_path),
-            "pareto_csv": str(pareto_path),
+            "performance_csv": _artifact_ref(aco_performance_path),
+            "od_evaluation_json": _artifact_ref(route_stability_path),
+            "pareto_csv": _artifact_ref(pareto_path),
         },
     }
-    pulse_evaluation_path.write_text(
-        json.dumps(pulse_payload, ensure_ascii=False, indent=2),
+    aco_run_history_path = REPORT_OUTPUT_DIR / "aco_run_history.csv"
+    aco_history_rows = []
+    for route in routes:
+        for row in route["aco_stats"].get("run_history", []):
+            aco_history_rows.append({"mode": route["mode"], **row})
+    pd.DataFrame(aco_history_rows).to_csv(
+        aco_run_history_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    rcsp_report_path = REPORT_OUTPUT_DIR / "rcsp_certification_report.json"
+    rcsp_routes = [
+        {
+            "mode": route["mode"],
+            "selected_source": route["selected_source"],
+            "optimality_proven": route["optimality_proven"],
+            "optimality_claim_scope": route["optimality_claim_scope"],
+            "timeout": route["search_stats"]["timeout"],
+            "aco_found_feasible": route["aco_found_feasible"],
+            "aco_objective": route["aco_objective"],
+            "rcsp_objective": route["rcsp_objective"],
+            "gap_pct": route["gap_pct"],
+            "detour_ratio": route["detour_ratio"],
+            "detour_constraint_satisfied": route[
+                "detour_constraint_satisfied"
+            ],
+            "risk_reduction_pct_against_shortest": route[
+                "risk_reduction_pct_against_shortest"
+            ],
+            "distance_increase_pct_against_shortest": route[
+                "distance_increase_pct_against_shortest"
+            ],
+            "labels_created": route["search_stats"]["labels_created"],
+            "labels_expanded": route["search_stats"]["labels_expanded"],
+            "dominance_prunes": route["search_stats"]["dominance_prunes"],
+            "resource_prunes": route["search_stats"]["resource_prunes"],
+            "upper_bound_prunes": route["search_stats"][
+                "upper_bound_prunes"
+            ],
+            "rcsp_used_aco_upper_bound": route[
+                "rcsp_used_aco_upper_bound"
+            ],
+        }
+        for route in routes
+    ]
+    rcsp_report = {
+        "algorithm": "aco_pareto_rcsp",
+        "optimality_proven_rate": round(
+            float(np.mean([route["optimality_proven"] for route in routes])),
+            6,
+        ),
+        "routes": rcsp_routes,
+        "od_certification_rate": route_stability_summary.get(
+            "rcsp_certification_rate", 0.0
+        ),
+    }
+    rcsp_report_path.write_text(
+        json.dumps(rcsp_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    route_algorithm_summary_path = (
+        REPORT_OUTPUT_DIR / "route_algorithm_summary.md"
+    )
+    route_algorithm_summary_path.write_text(
+        _route_algorithm_summary_markdown(
+            routes,
+            route_stability_summary,
+            aco_evaluation_path,
+            rcsp_report_path,
+        ),
+        encoding="utf-8",
+    )
+    aco_payload["artifacts"].update(
+        {
+            "aco_run_history_csv": _artifact_ref(aco_run_history_path),
+            "rcsp_certification_json": _artifact_ref(rcsp_report_path),
+            "route_algorithm_summary_md": _artifact_ref(
+                route_algorithm_summary_path
+            ),
+            "od_algorithm_csv": _artifact_ref(od_algorithm_path),
+        }
+    )
+    aco_evaluation_path.write_text(
+        json.dumps(aco_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return {
@@ -2617,8 +2905,12 @@ def run_actual_route_recommendation(
         "endpoint_path": endpoint_path,
         "route_stability": route_stability_summary,
         "route_stability_path": route_stability_path,
-        "pulse_performance_path": pulse_performance_path,
-        "pulse_evaluation_path": pulse_evaluation_path,
+        "aco_performance_path": aco_performance_path,
+        "aco_evaluation_path": aco_evaluation_path,
+        "aco_run_history_path": aco_run_history_path,
+        "rcsp_report_path": rcsp_report_path,
+        "route_algorithm_summary_path": route_algorithm_summary_path,
+        "od_algorithm_path": od_algorithm_path,
     }
 
 
@@ -2697,7 +2989,7 @@ def run_full_pipeline(
             "f1_target_achieved"
         ],
         "route": {
-            "algorithm": "pulse",
+            "algorithm": route_result["shortest"]["algorithm"],
             "origin": route_result["endpoints"]["origin_name"],
             "destination": route_result["endpoints"]["destination_name"],
             "shortest_distance_m": route_result["shortest"][
@@ -2730,37 +3022,90 @@ def run_full_pipeline(
             "stability_validation": route_result["route_stability"],
         },
         "artifacts": {
-            "edge_features": str(EDGE_FEATURE_PATH),
-            "edge_cmcs": str(EDGE_CMCS_PATH),
-            "scored_graph": str(SCORED_GRAPH_PATH),
-            "edge_model": str(EDGE_MODEL_PATH),
-            "regional_model": str(REGIONAL_MODEL_PATH),
-            "regional_model_report": str(REGIONAL_MODEL_REPORT_PATH),
-            "cmcs_data_driven_weights": str(DATA_DRIVEN_WEIGHTS_PATH),
-            "cmcs_weight_evidence_report": str(DATA_DRIVEN_REPORT_PATH),
-            "cmcs_weight_evidence_chart": str(DATA_DRIVEN_CHART_PATH),
-            "route_map": str(route_result["map_path"]),
-            "route_comparison": str(route_result["comparison_path"]),
-            "city_risk_map": str(risk_map_path),
-            "route_pareto_chart": str(route_result["pareto_chart_path"]),
-            "avoided_segments": str(route_result["avoided_path"]),
-            "route_stability_evaluation": str(
+            "edge_features": _artifact_ref(EDGE_FEATURE_PATH),
+            "edge_cmcs": _artifact_ref(EDGE_CMCS_PATH),
+            "scored_graph": _artifact_ref(SCORED_GRAPH_PATH),
+            "edge_model": _artifact_ref(EDGE_MODEL_PATH),
+            "regional_model": _artifact_ref(REGIONAL_MODEL_PATH),
+            "regional_model_report": _artifact_ref(REGIONAL_MODEL_REPORT_PATH),
+            "cmcs_data_driven_weights": _artifact_ref(DATA_DRIVEN_WEIGHTS_PATH),
+            "cmcs_weight_evidence_report": _artifact_ref(DATA_DRIVEN_REPORT_PATH),
+            "cmcs_weight_evidence_chart": _artifact_ref(DATA_DRIVEN_CHART_PATH),
+            "route_map": _artifact_ref(route_result["map_path"]),
+            "actual_route_comparison": _artifact_ref(route_result["comparison_path"]),
+            "city_risk_map": _artifact_ref(risk_map_path),
+            "actual_route_pareto": _artifact_ref(route_result["pareto_path"]),
+            "route_pareto_chart": _artifact_ref(route_result["pareto_chart_path"]),
+            "avoided_segments": _artifact_ref(route_result["avoided_path"]),
+            "route_stability_evaluation": _artifact_ref(
                 route_result["route_stability_path"]
             ),
-            "pulse_algorithm_performance": str(
-                route_result["pulse_performance_path"]
+            "aco_pareto_algorithm_performance": _artifact_ref(
+                route_result["aco_performance_path"]
             ),
-            "pulse_algorithm_evaluation": str(
-                route_result["pulse_evaluation_path"]
+            "aco_pareto_algorithm_evaluation": _artifact_ref(
+                route_result["aco_evaluation_path"]
             ),
-            "district_summary": str(
+            "aco_run_history": _artifact_ref(
+                route_result["aco_run_history_path"]
+            ),
+            "rcsp_certification_report": _artifact_ref(
+                route_result["rcsp_report_path"]
+            ),
+            "route_algorithm_summary": _artifact_ref(
+                route_result["route_algorithm_summary_path"]
+            ),
+            "od_algorithm_evaluation": _artifact_ref(
+                route_result["od_algorithm_path"]
+            ),
+            "district_summary": _artifact_ref(
                 REPORT_OUTPUT_DIR / "district_safety_summary.csv"
             ),
-            "district_radar": str(district_chart_path),
+            "district_radar": _artifact_ref(district_chart_path),
         },
     }
+    manifest_path = REPORT_OUTPUT_DIR / "final_outputs_manifest.json"
+    report["artifacts"]["final_outputs_manifest"] = _artifact_ref(manifest_path)
+    optional_final_reports = {
+        "final_model_safety_evaluation_json": REPORT_OUTPUT_DIR
+        / "final_model_safety_evaluation.json",
+        "final_model_safety_evaluation_md": REPORT_OUTPUT_DIR
+        / "final_model_safety_evaluation.md",
+    }
+    for key, path in optional_final_reports.items():
+        if path.exists():
+            report["artifacts"][key] = _artifact_ref(path)
+    report = _relative_report_paths(report)
     FULL_PIPELINE_REPORT_PATH.write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    manifest = {
+        "generated_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "algorithm": "aco_pareto_rcsp",
+        "algorithm_version": "aco_pareto_rcsp_v1",
+        "files": report["artifacts"],
+        "key_metrics": {
+            "risk_reduction_pct": report["route"]["risk_reduction_pct"],
+            "mean_detour_ratio": report["route"]["stability_validation"].get(
+                "mean_detour_ratio"
+            ),
+            "detour_constraint_satisfaction_rate": report["route"][
+                "stability_validation"
+            ].get("detour_constraint_satisfaction_rate"),
+            "aco_success_rate": report["route"]["stability_validation"].get(
+                "aco_success_rate"
+            ),
+            "rcsp_certification_rate": report["route"][
+                "stability_validation"
+            ].get("rcsp_certification_rate"),
+            "mean_gap_pct": report["route"]["stability_validation"].get(
+                "mean_gap_pct"
+            ),
+        },
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     return report

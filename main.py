@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
+from pathlib import Path
 
 from config import (
     GRAPH_DATA_DIR,
     PROCESSED_DATA_DIR,
+    REPORT_OUTPUT_DIR,
     SETTINGS,
     ensure_directories,
 )
@@ -20,6 +24,127 @@ from src.full_pipeline import (
 )
 from src.final_model_evaluation import generate_final_model_evaluation
 from src.real_data_pipeline import run_real_data_pipeline
+
+
+def _artifact_ref(path: str | Path) -> str:
+    path = Path(path)
+    try:
+        return path.resolve().relative_to(Path.cwd().resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def clean_artifacts() -> dict[str, int]:
+    removed = {"files": 0, "directories": 0}
+    root = Path(".")
+    directory_names = {"__pycache__", ".pytest_cache", "cmcs_safe_route.egg-info"}
+    old_pulse_reports = {
+        "outputs/reports/pulse_algorithm_evaluation.json",
+        "outputs/reports/pulse_algorithm_performance.csv",
+        "outputs/reports/route_comparison.csv",
+        "outputs/reports/pareto_front.csv",
+    }
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        relative = path.as_posix()
+        if path.is_dir() and path.name in directory_names:
+            shutil.rmtree(path, ignore_errors=True)
+            removed["directories"] += 1
+        elif path.is_file() and (
+            path.suffix == ".pyc"
+            or path.name in {".DS_Store", "outputs.zip"}
+            or relative in old_pulse_reports
+        ):
+            path.unlink(missing_ok=True)
+            removed["files"] += 1
+    return removed
+
+
+def run_algorithm_evaluation() -> dict[str, object]:
+    result = run_demo(with_visuals=False)
+    comparison = result["comparison"]
+    history_rows = []
+    rcsp_rows = []
+    for _, row in comparison.iterrows():
+        aco_stats = row.get("aco_stats") or {}
+        rcsp_stats = row.get("rcsp_stats") or {}
+        for history in aco_stats.get("run_history", []):
+            history_rows.append({"mode": row["mode"], **history})
+        rcsp_rows.append(
+            {
+                "mode": row["mode"],
+                "selected_source": row["selected_source"],
+                "optimality_proven": bool(row["optimality_proven"]),
+                "optimality_claim_scope": row["optimality_claim_scope"],
+                "timeout": bool(row["search_stats"]["timeout"]),
+                "aco_found_feasible": bool(row["aco_found_feasible"]),
+                "aco_objective": row["aco_objective"],
+                "rcsp_objective": row["rcsp_objective"],
+                "gap_pct": row["gap_pct"],
+                "detour_ratio": row["detour_ratio"],
+                "detour_constraint_satisfied": bool(
+                    row["detour_constraint_satisfied"]
+                ),
+                "risk_reduction_pct_against_shortest": row[
+                    "risk_reduction_pct_against_shortest"
+                ],
+                "distance_increase_pct_against_shortest": row[
+                    "distance_increase_pct_against_shortest"
+                ],
+                "labels_created": rcsp_stats.get("labels_created", 0),
+                "labels_expanded": rcsp_stats.get("labels_expanded", 0),
+                "dominance_prunes": rcsp_stats.get("dominance_prunes", 0),
+                "resource_prunes": rcsp_stats.get("resource_prunes", 0),
+                "upper_bound_prunes": rcsp_stats.get("upper_bound_prunes", 0),
+                "rcsp_used_aco_upper_bound": bool(
+                    row["rcsp_used_aco_upper_bound"]
+                ),
+            }
+        )
+
+    import pandas as pd
+
+    aco_history_path = REPORT_OUTPUT_DIR / "aco_run_history.csv"
+    pd.DataFrame(history_rows).to_csv(
+        aco_history_path, index=False, encoding="utf-8-sig"
+    )
+    rcsp_report_path = REPORT_OUTPUT_DIR / "rcsp_certification_report.json"
+    rcsp_report = {
+        "algorithm": "aco_pareto_rcsp",
+        "routes": rcsp_rows,
+        "optimality_proven_rate": float(
+            comparison["optimality_proven"].mean()
+        ),
+    }
+    rcsp_report_path.write_text(
+        json.dumps(rcsp_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    summary_path = REPORT_OUTPUT_DIR / "route_algorithm_summary.md"
+    summary_path.write_text(
+        """# ACO-Pareto RCSP Route Algorithm Summary
+
+- Route distance: `L(P)=sum length_e`
+- Route risk cost: `C(P)=sum safety_cost_e`
+- Detour constraint: `L(P) <= L(P_shortest) * r_age`
+- Balanced objective: `Score_lambda(P)=lambda L(P)+(1-lambda)C(P)`
+- Pareto dominance removes labels with no better distance or objective.
+- ACO는 확률적 후보 경로와 초기 상한을 제공하고, Pareto Label-Correcting RCSP가 지정된 탐색 범위에서 종료되는 경우 해당 범위 내 최적성을 인증한다.
+""",
+        encoding="utf-8",
+    )
+    return {
+        "algorithm": "aco_pareto_rcsp",
+        "routes": int(len(comparison)),
+        "evaluation_json": _artifact_ref(
+            REPORT_OUTPUT_DIR / "aco_pareto_algorithm_evaluation.json"
+        ),
+        "performance_csv": _artifact_ref(
+            REPORT_OUTPUT_DIR / "aco_pareto_algorithm_performance.csv"
+        ),
+        "aco_run_history_csv": _artifact_ref(aco_history_path),
+        "rcsp_certification_json": _artifact_ref(rcsp_report_path),
+        "summary_md": _artifact_ref(summary_path),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +183,16 @@ def parse_args() -> argparse.Namespace:
     )
     full_parser.add_argument("--refresh-data", action="store_true")
     full_parser.add_argument("--refresh-network", action="store_true")
+
+    subparsers.add_parser(
+        "evaluate-algorithm",
+        help="Run only the ACO-Pareto RCSP route algorithm evaluation",
+    )
+
+    subparsers.add_parser(
+        "clean-artifacts",
+        help="Remove caches, bytecode, zip files, egg-info, and old Pulse reports",
+    )
 
     train_parser = subparsers.add_parser(
         "train-edge-models",
@@ -176,6 +311,7 @@ def main() -> None:
             f"목표달성={regional_model['f1_target_achieved']}"
         )
         print(
+            f"경로 알고리즘: {route['algorithm']}, "
             f"실제 경로: {route['origin']} → {route['destination']}, "
             f"최단 {route['shortest_distance_m']:.0f}m / "
             f"안전 {route['safest_distance_m']:.0f}m / "
@@ -189,6 +325,18 @@ def main() -> None:
             f"안정성={stability['route_selection_stability_passed']}"
         )
         print(f"지도: {report['artifacts']['route_map']}")
+    elif command == "evaluate-algorithm":
+        report = run_algorithm_evaluation()
+        print("\nACO-Pareto RCSP algorithm evaluation complete")
+        print(f"Routes evaluated: {report['routes']}")
+        print(f"Evaluation JSON: {report['evaluation_json']}")
+        print(f"Performance CSV: {report['performance_csv']}")
+    elif command == "clean-artifacts":
+        removed = clean_artifacts()
+        print(
+            "Cleaned artifacts: "
+            f"{removed['files']} files, {removed['directories']} directories"
+        )
     elif command == "train-edge-models":
         import pandas as pd
 

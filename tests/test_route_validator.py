@@ -167,7 +167,7 @@ def test_batch_od_report_written(tmp_path):
     _, opt = _build_graph()
     od = [("A", "D", "학교A", "학원D")]
     batch_od_evaluation(opt, od, output_path=tmp_path / "od.json")
-    data = json.loads((tmp_path / "od.json").read_text())
+    data = json.loads((tmp_path / "od.json").read_text(encoding="utf-8"))
     assert "total_pairs" in data
     assert "age_profile" in data
 
