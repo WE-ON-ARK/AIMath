@@ -73,6 +73,7 @@ from src.real_data_pipeline import (
 )
 from src.route_optimizer import RouteOptimizer
 from src.route_validator import batch_od_evaluation
+from src.visualize_risk_zones import generate_risk_zone_map_artifacts
 
 
 PROJECTED_CRS = "EPSG:5179"
@@ -2645,6 +2646,12 @@ def run_actual_route_recommendation(
     map_path = create_actual_route_map(
         optimizer.G, routes, endpoints
     )
+    risk_zone_outputs = generate_risk_zone_map_artifacts(
+        optimizer.G,
+        shortest_route=shortest,
+        safest_route=safest,
+        endpoints=endpoints,
+    )
     endpoint_path = REPORT_OUTPUT_DIR / "actual_route_endpoints.json"
     endpoint_path.write_text(
         json.dumps(endpoints, ensure_ascii=False, indent=2),
@@ -2965,6 +2972,7 @@ def run_actual_route_recommendation(
         "comparison": comparison,
         "pareto": pareto,
         "map_path": map_path,
+        "risk_zone_outputs": risk_zone_outputs,
         "comparison_path": comparison_path,
         "pareto_path": pareto_path,
         "pareto_chart_path": pareto_chart_path,
@@ -3113,6 +3121,29 @@ def run_full_pipeline(
             "route_map": _artifact_ref(route_result["map_path"]),
             "actual_route_comparison": _artifact_ref(route_result["comparison_path"]),
             "city_risk_map": _artifact_ref(risk_map_path),
+            "daejeon_cmcs_risk_overview_png": _artifact_ref(
+                route_result["risk_zone_outputs"][
+                    "daejeon_cmcs_risk_overview_png"
+                ]
+            ),
+            "daejeon_cmcs_risk_overview_html": _artifact_ref(
+                route_result["risk_zone_outputs"][
+                    "daejeon_cmcs_risk_overview_html"
+                ]
+            ),
+            "pilot_cmcs_risk_zone_map_png": _artifact_ref(
+                route_result["risk_zone_outputs"][
+                    "pilot_cmcs_risk_zone_map_png"
+                ]
+            ),
+            "pilot_cmcs_risk_zone_map_html": _artifact_ref(
+                route_result["risk_zone_outputs"][
+                    "pilot_cmcs_risk_zone_map_html"
+                ]
+            ),
+            "risk_zone_map_summary": _artifact_ref(
+                route_result["risk_zone_outputs"]["risk_zone_map_summary"]
+            ),
             "actual_route_pareto": _artifact_ref(route_result["pareto_path"]),
             "route_pareto_chart": _artifact_ref(route_result["pareto_chart_path"]),
             "avoided_segments": _artifact_ref(route_result["avoided_path"]),

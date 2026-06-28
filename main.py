@@ -24,6 +24,7 @@ from src.full_pipeline import (
 )
 from src.final_model_evaluation import generate_final_model_evaluation
 from src.real_data_pipeline import run_real_data_pipeline
+from src.visualize_risk_zones import generate_risk_zone_maps_from_saved_artifacts
 
 
 def _artifact_ref(path: str | Path) -> str:
@@ -190,6 +191,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     subparsers.add_parser(
+        "visualize-risk-zones",
+        help="Generate CMCS risk-zone overview and pilot-route maps",
+    )
+
+    subparsers.add_parser(
         "clean-artifacts",
         help="Remove caches, bytecode, zip files, egg-info, and old Pulse reports",
     )
@@ -331,6 +337,11 @@ def main() -> None:
         print(f"Routes evaluated: {report['routes']}")
         print(f"Evaluation JSON: {report['evaluation_json']}")
         print(f"Performance CSV: {report['performance_csv']}")
+    elif command == "visualize-risk-zones":
+        outputs = generate_risk_zone_maps_from_saved_artifacts()
+        print("\nCMCS risk-zone maps generated")
+        for name, path in outputs.items():
+            print(f"{name}: {_artifact_ref(path)}")
     elif command == "clean-artifacts":
         removed = clean_artifacts()
         print(
