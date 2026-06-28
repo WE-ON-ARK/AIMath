@@ -208,6 +208,36 @@ def batch_od_evaluation(
             "balanced_labels_expanded": balanced["search_stats"][
                 "labels_expanded"
             ],
+            "pure_aco_success_rate": float(
+                np.mean(
+                    [
+                        route["aco_stats"]["pure_aco_feasible_solutions"]
+                        / max(1, route["aco_stats"]["ants_total"])
+                        for route in (shortest, safest, balanced)
+                    ]
+                )
+            ),
+            "seeded_aco_success_rate": float(
+                np.mean(
+                    [
+                        route["aco_stats"]["seeded_feasible_solutions"]
+                        / max(1, route["aco_stats"]["ants_total"])
+                        for route in (shortest, safest, balanced)
+                    ]
+                )
+            ),
+            "combined_candidate_success_rate": float(
+                np.mean(
+                    [
+                        (
+                            route["aco_stats"]["pure_aco_feasible_solutions"]
+                            + route["aco_stats"]["seeded_feasible_solutions"]
+                        )
+                        / max(1, route["aco_stats"]["ants_total"])
+                        for route in (shortest, safest, balanced)
+                    ]
+                )
+            ),
             "aco_success_rate": float(
                 np.mean(
                     [
@@ -274,6 +304,25 @@ def batch_od_evaluation(
         "mean_detour_ratio": round(float(df["detour_ratio"].mean()), 4) if len(df) else 0,
         "mean_risk_reduction_pct": round(float(df["risk_reduction_pct"].mean()), 2) if len(df) else 0,
         "algorithm": df["algorithm"].iloc[0] if len(df) else "aco_pareto_rcsp",
+        "pure_aco_success_rate": round(
+            float(df["pure_aco_success_rate"].mean()), 6
+        )
+        if len(df)
+        else 0.0,
+        "seeded_aco_success_rate": round(
+            float(df["seeded_aco_success_rate"].mean()), 6
+        )
+        if len(df)
+        else 0.0,
+        "combined_candidate_success_rate": round(
+            float(df["combined_candidate_success_rate"].mean()), 6
+        )
+        if len(df)
+        else 0.0,
+        "aco_success_rate": round(float(df["aco_success_rate"].mean()), 6)
+        if len(df)
+        else 0.0,
+        "aco_success_rate_note": "seeded included legacy compatibility field",
         "mean_total_runtime_ms": round(
             float(
                 df[

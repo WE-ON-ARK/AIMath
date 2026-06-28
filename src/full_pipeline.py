@@ -117,6 +117,17 @@ def _relative_report_paths(value):
             pass
     return value
 
+
+def _normalize_json_file_paths(path: str | Path) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(
+        json.dumps(_relative_report_paths(payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
 EDGE_MODEL_FEATURES = [
     "traffic_volume_norm",
     "avg_speed_norm",
@@ -2380,8 +2391,9 @@ def create_actual_route_map(
 
 
 # 경로 1건당 양방향 Pulse 탐색 시간 상한(초). 안전비용 목적은 하한이 약해
-# 긴 OD에서 최적성 증명에 오래 걸릴 수 있다. 시드가 최적값을 빠르게 찾으므로
-# 예산을 초과해도 반환 경로값은 사실상 최적이며 "증명"만 생략된다.
+# Per-route budget for seeded ACO candidate generation and RCSP certification.
+# ACO supplies candidates and upper bounds; optimality claims come only from
+# RCSP completion over the declared search scope.
 ROUTE_TIME_BUDGET_S = 60.0
 # OD 경로 선정 안정성 검증 쌍 수. 각 쌍이 안전비용 목적의 약한 하한 탐색을
 # 2회(safest+balanced) 수행하므로 쌍 수가 전체 실행시간을 지배한다.
@@ -2395,6 +2407,26 @@ def _route_algorithm_summary_markdown(
     evaluation_path: Path,
     rcsp_report_path: Path,
 ) -> str:
+    total_ants = sum(int(route["aco_stats"].get("ants_total", 0)) for route in routes)
+    pure_feasible = sum(
+        int(route["aco_stats"].get("pure_aco_feasible_solutions", 0))
+        for route in routes
+    )
+    seeded_feasible = sum(
+        int(route["aco_stats"].get("seeded_feasible_solutions", 0))
+        for route in routes
+    )
+    combined_feasible = pure_feasible + seeded_feasible
+    pure_rate = pure_feasible / total_ants if total_ants else 0.0
+    seeded_rate = seeded_feasible / total_ants if total_ants else 0.0
+    combined_rate = combined_feasible / total_ants if total_ants else 0.0
+    pure_limited_note = (
+        "In the current real-road pilot runs, pure ACO feasible ants were 0; "
+        "seed connector based candidate generation provided the stable feasible "
+        "paths used as RCSP upper bounds."
+        if pure_feasible == 0
+        else "Pure ACO found at least one feasible route in the pilot runs."
+    )
     route_rows = "\n".join(
         (
             f"| {route['mode']} | {route['selected_source']} | "
@@ -2409,9 +2441,11 @@ def _route_algorithm_summary_markdown(
 ## Algorithm
 
 The final route search engine is `aco_pareto_rcsp`.
-Ant Colony Optimization first finds a feasible candidate and supplies its
-objective value as an initial upper bound. Pareto Label-Correcting RCSP then
-searches the constrained label space to improve or certify the incumbent.
+ACO provides seed-based probabilistic candidate paths and an initial upper
+bound. When Pareto Label-Correcting RCSP completes the full graph search, it
+certifies optimality under the detour constraint.
+
+본 연구의 경로 탐색 알고리즘은 ACO 단독 최적화기가 아니라, seed 기반 ACO 후보 생성과 Pareto Label-Correcting RCSP 인증을 결합한 하이브리드 구조이다. ACO는 확률적 탐색과 seed connector를 통해 초기 feasible path 및 upper bound를 제공하며, RCSP는 dominance pruning과 resource constraint를 이용해 전체 그래프에서 최적성 인증을 수행한다. 따라서 최종 경로의 최적성 주장은 ACO가 아니라 RCSP 인증 결과에 근거한다. ACO의 역할은 창의적 후보 생성 및 탐색 상한 제공이며, 순수 ACO 성공률과 seed 포함 성공률은 별도로 해석한다.
 
 ## Mathematical Formulation
 
@@ -2423,12 +2457,12 @@ searches the constrained label space to improve or certify the incumbent.
   `L_A <= L_B`, `C_A <= C_B`, and at least one inequality is strict.
 - If RCSP exhausts the search space, then
   `C(P_RCSP) = min C(P), subject to L(P) <= B`.
-- ACO does not guarantee global optimality by itself. Final reliability is
-  reported through RCSP certification when available, or through the measured
-  ACO-vs-RCSP gap when the RCSP pass times out.
-- ACO는 확률적 후보 경로와 초기 상한을 제공하고, Pareto
-  Label-Correcting RCSP가 지정된 탐색 범위에서 종료되는 경우 해당
-  범위 내 최적성을 인증한다.
+- ACO does not certify global optimality and is not reported as a standalone
+  optimizer. Optimality claims are based on RCSP completion over the declared
+  search scope.
+- ACO는 seed 기반 확률적 후보 경로와 초기 상한을 제공하고, Pareto
+  Label-Correcting RCSP가 전체 그래프 탐색을 완료하는 경우 우회율
+  제약 하 최적성을 인증한다.
 
 ## Actual Route Runs
 
@@ -2448,10 +2482,24 @@ searches the constrained label space to improve or certify the incumbent.
 - Positive risk reduction ratio: {stability.get('positive_risk_reduction_ratio', 0)}
 - Mean runtime ms: {stability.get('mean_runtime_ms', 0)}
 - P95 runtime ms: {stability.get('p95_runtime_ms', 0)}
-- ACO success rate: {stability.get('aco_success_rate', 0)}
+- pure ACO success rate: {stability.get('pure_aco_success_rate', 0)}
+- seeded ACO success rate: {stability.get('seeded_aco_success_rate', 0)}
+- combined candidate success rate: {stability.get('combined_candidate_success_rate', stability.get('aco_success_rate', 0))}
+- ACO success rate (legacy, seeded included): {stability.get('aco_success_rate', 0)}
 - RCSP certification rate: {stability.get('rcsp_certification_rate', 0)}
 - Mean gap pct: {stability.get('mean_gap_pct', 0)}
 - P95 gap pct: {stability.get('p95_gap_pct', 0)}
+
+## ACO Run History Interpretation
+
+- Pilot ants total: {total_ants}
+- pure ACO feasible ants: {pure_feasible}
+- seeded connector feasible ants: {seeded_feasible}
+- pure ACO success rate: {pure_rate:.6f}
+- seeded ACO success rate: {seeded_rate:.6f}
+- combined candidate success rate: {combined_rate:.6f}
+- Interpretation: {pure_limited_note}
+- 실제 도로 그래프에서는 완전 무작위 ACO보다 seed 기반 후보 생성이 안정적이었다. 따라서 `aco_run_history.csv`의 `best_source=seeded_connector`는 ACO 단독 최적 경로 발견이 아니라, seed connector 기반 후보가 RCSP의 초기 상한으로 사용되었음을 뜻한다.
 
 ## Artifacts
 
@@ -2724,6 +2772,22 @@ def run_actual_route_recommendation(
                     float(route_stability["aco_success_rate"].mean()),
                     6,
                 ),
+                "pure_aco_success_rate": round(
+                    float(route_stability["pure_aco_success_rate"].mean()),
+                    6,
+                ),
+                "seeded_aco_success_rate": round(
+                    float(route_stability["seeded_aco_success_rate"].mean()),
+                    6,
+                ),
+                "combined_candidate_success_rate": round(
+                    float(
+                        route_stability[
+                            "combined_candidate_success_rate"
+                        ].mean()
+                    ),
+                    6,
+                ),
                 "rcsp_certification_rate": round(
                     float(route_stability["rcsp_certified"].mean()),
                     6,
@@ -2747,6 +2811,9 @@ def run_actual_route_recommendation(
                 "mean_runtime_ms": 0.0,
                 "p95_runtime_ms": 0.0,
                 "aco_success_rate": 0.0,
+                "pure_aco_success_rate": 0.0,
+                "seeded_aco_success_rate": 0.0,
+                "combined_candidate_success_rate": 0.0,
                 "rcsp_certification_rate": 0.0,
                 "mean_gap_pct": 0.0,
                 "p95_gap_pct": 0.0,
@@ -2927,6 +2994,18 @@ def run_full_pipeline(
     segment_scores, regional_model_report = train_regional_boosting_model(
         segment_scores
     )
+    for report_path in (
+        DATA_DRIVEN_REPORT_PATH,
+        EDGE_MODEL_REPORT_PATH,
+        REGIONAL_MODEL_REPORT_PATH,
+    ):
+        _normalize_json_file_paths(report_path)
+    edge_model_report = json.loads(
+        EDGE_MODEL_REPORT_PATH.read_text(encoding="utf-8")
+    )
+    regional_model_report = json.loads(
+        REGIONAL_MODEL_REPORT_PATH.read_text(encoding="utf-8")
+    )
     score_columns = segment_scores[
         [
             "segment_id",
@@ -3096,6 +3175,15 @@ def run_full_pipeline(
             "aco_success_rate": report["route"]["stability_validation"].get(
                 "aco_success_rate"
             ),
+            "pure_aco_success_rate": report["route"][
+                "stability_validation"
+            ].get("pure_aco_success_rate"),
+            "seeded_aco_success_rate": report["route"][
+                "stability_validation"
+            ].get("seeded_aco_success_rate"),
+            "combined_candidate_success_rate": report["route"][
+                "stability_validation"
+            ].get("combined_candidate_success_rate"),
             "rcsp_certification_rate": report["route"][
                 "stability_validation"
             ].get("rcsp_certification_rate"),

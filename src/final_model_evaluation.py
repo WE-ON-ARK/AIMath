@@ -514,6 +514,8 @@ F1 {intervals['f1'][0]:.3f}–{intervals['f1'][1]:.3f}.
   위험노출 감소, 중앙값 {route_stability.get('median_risk_reduction_pct', 0):.1f}%
 - 주의: 정답 통학 경로 라벨은 없어 경로 선정 자체의 F1은 계산할 수 없습니다.
 
+본 연구의 경로 탐색 알고리즘은 ACO 단독 최적화기가 아니라, seed 기반 ACO 후보 생성과 Pareto Label-Correcting RCSP 인증을 결합한 하이브리드 구조이다. ACO는 확률적 탐색과 seed connector를 통해 초기 feasible path 및 upper bound를 제공하며, RCSP는 dominance pruning과 resource constraint를 이용해 전체 그래프에서 최적성 인증을 수행한다. 따라서 최종 경로의 최적성 주장은 ACO가 아니라 RCSP 인증 결과에 근거한다. ACO의 역할은 창의적 후보 생성 및 탐색 상한 제공이며, 순수 ACO 성공률과 seed 포함 성공률은 별도로 해석한다.
+
 ## 최종 적용 범위
 
 | 적용 시나리오 | 판정 |

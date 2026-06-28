@@ -37,8 +37,9 @@ class RouteOptimizer:
             raise ValueError("algorithm must be 'aco_pareto_rcsp'")
         self._algorithm_name = "aco_pareto_rcsp"
         self._requested_algorithm = algorithm
-        # 경로 1건당 탐색 시간 상한(anytime 안전망). 초과 시 현재까지 찾은
-        # 최적 incumbent(시드가 빠르게 최적값을 찾으므로 보통 최적값)를 반환한다.
+        # Per-route budget for candidate generation and RCSP certification.
+        # ACO supplies an incumbent upper bound; optimality is claimed only when
+        # RCSP finishes within the declared search scope.
         self._route_time_budget_s = route_time_budget_s
 
         if cmcs_data is None and cmcs_path is not None:
